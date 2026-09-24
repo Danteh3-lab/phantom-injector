@@ -1,0 +1,22 @@
+## .NET build artifacts
+bin/
+obj/
+*.user
+*.suo
+
+## Publish output
+publish/
+artifacts/
+
+## Test DLLs / local injection targets
+testdll/bin/
+testdll/obj/
+*.dll.tmp
+
+## Rider / VS
+.idea/
+.vs/
+
+## OS
+Thumbs.db
+desktop.ini
