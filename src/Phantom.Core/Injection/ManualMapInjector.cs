@@ -21,23 +21,28 @@ internal sealed class ManualMapInjector : InjectorBase
         var remoteStub = IntPtr.Zero;
         var committed = false;
 
-        // The mapped image / init stub may still be referenced (a thread runs the
-        // stub, or a live function table points into it): keep them mapped.
+        // The image and stub have separate lifetimes. A running init thread can
+        // still execute the stub and call into the image; an exited thread may
+        // leave only image state (such as a registered function table) behind.
         var imageHazard = false;
+        var initStubHazard = false;
 
         // A dependency load/release thread may still be running: do not touch the
         // process's loader state again, but the image itself is unaffected.
         var dependencyHazard = false;
 
         var dependencies = new List<IntPtr>();
-        var dependenciesReleased = false;
+        var dependencyCleanupHandled = false;
 
         // Releases already-acquired dependency references and records the
         // rollback outcome on the message, so a failure never claims cleanup
         // that did not happen.
         InjectionResult FailMapping(string message)
         {
-            if (!dependencyHazard && dependencies.Count > 0)
+            // Keep dependency references when the mapped image may still be
+            // executing or retained with uncertain initialization state. Its
+            // IAT (or code started during attach) can still use those modules.
+            if (!dependencyHazard && !imageHazard && dependencies.Count > 0)
             {
                 if (!ReleaseDependencies(hProcess, pid, dependencies, options.TimeoutMs, out var releaseError))
                 {
@@ -46,7 +51,7 @@ internal sealed class ManualMapInjector : InjectorBase
                 }
             }
 
-            dependenciesReleased = true;
+            dependencyCleanupHandled = true;
             return InjectionResult.Fail(Method, dllPath, message);
         }
 
@@ -167,6 +172,7 @@ internal sealed class ManualMapInjector : InjectorBase
             if (init.UnsafeToFree)
             {
                 imageHazard = true;
+                initStubHazard = true;
                 return FailMapping("Image initialization did not complete; the remote thread may still be running so the mapped image was left intact.");
             }
 
@@ -232,20 +238,22 @@ internal sealed class ManualMapInjector : InjectorBase
                 // acquired; a committed one retains them (there is no unmap yet).
                 // Safety net for paths that threw instead of going through
                 // FailMapping: release what was acquired.
-                if (!dependenciesReleased && !dependencyHazard && !committed && dependencies.Count > 0)
+                if (!dependencyCleanupHandled && !dependencyHazard && !imageHazard &&
+                    !committed && dependencies.Count > 0)
                 {
                     if (!ReleaseDependencies(hProcess, pid, dependencies, options.TimeoutMs, out _))
                         dependencyHazard = true;
                 }
 
-                // Only release remote memory once no thread we started can still
-                // be executing from it.
-                if (!imageHazard)
-                {
+                // Retain the init stub only while the initialization thread may
+                // still execute from it. The image can outlive a completed stub
+                // if unwind metadata or uncertain initialization state refers
+                // to it.
+                if (!initStubHazard)
                     FreeRemote(hProcess, remoteStub);
-                    if (!committed)
-                        FreeRemote(hProcess, remoteBase);
-                }
+
+                if (!imageHazard && !committed)
+                    FreeRemote(hProcess, remoteBase);
 
                 NativeMethods.CloseHandle(hProcess);
             }
@@ -298,20 +306,22 @@ internal sealed class ManualMapInjector : InjectorBase
 
     private static byte[] BuildImage(PeImage pe)
     {
-        var image = new byte[pe.SizeOfImage];
+        var image = new byte[checked((int)pe.SizeOfImage)];
         var headerBytes = (int)Math.Min(pe.SizeOfHeaders, (uint)pe.Raw.Length);
         Buffer.BlockCopy(pe.Raw, 0, image, 0, Math.Min(headerBytes, image.Length));
 
         foreach (var s in pe.Sections)
         {
-            if (s.SizeOfRawData == 0 || s.VirtualAddress >= image.Length)
+            if (s.SizeOfRawData == 0)
                 continue;
 
             var dest = (int)s.VirtualAddress;
-            var copy = (int)Math.Min(s.SizeOfRawData, (uint)(image.Length - dest));
-            copy = Math.Min(copy, pe.Raw.Length - (int)s.PointerToRawData);
-            if (copy > 0)
-                Buffer.BlockCopy(pe.Raw, (int)s.PointerToRawData, image, dest, copy);
+            var source = checked((int)s.PointerToRawData);
+            var copy = checked((int)s.SizeOfRawData);
+            if ((long)dest + copy > image.Length || (long)source + copy > pe.Raw.Length)
+                throw new BadImageFormatException($"Section '{s.Name}' cannot be copied without truncation.");
+
+            Buffer.BlockCopy(pe.Raw, source, image, dest, copy);
         }
 
         return image;
@@ -573,10 +583,14 @@ internal sealed class ManualMapInjector : InjectorBase
 
         // Guard against corrupt export tables before allocating read buffers,
         // and require every table to lie inside the exporting module's image.
-        if (numberOfNames > 0x10000 || numberOfFunctions > 0x10000 ||
+        if (numberOfFunctions == 0 ||
+            numberOfNames > 0x10000 || numberOfFunctions > 0x10000 ||
             !RangeInImage(addressOfFunctions, (ulong)numberOfFunctions * 4, sizeOfImage) ||
-            !RangeInImage(addressOfNames, (ulong)numberOfNames * 4, sizeOfImage) ||
-            !RangeInImage(addressOfNameOrdinals, (ulong)numberOfNames * 2, sizeOfImage))
+            !TableRangeInImage(addressOfNames, (ulong)numberOfNames * 4, sizeOfImage) ||
+            !TableRangeInImage(addressOfNameOrdinals, (ulong)numberOfNames * 2, sizeOfImage))
+            return default;
+
+        if (numberOfNames == 0)
             return default;
 
         var names = ReadRemote(hProcess, IntPtr.Add(moduleBase, (int)addressOfNames), (int)numberOfNames * 4);
@@ -585,7 +599,13 @@ internal sealed class ManualMapInjector : InjectorBase
         for (var i = 0; i < numberOfNames; i++)
         {
             var nameRva = ReadU32(names, i * 4);
-            var name = ReadRemoteString(hProcess, IntPtr.Add(moduleBase, (int)nameRva), 128);
+            if (!RangeInImage(nameRva, 1, sizeOfImage))
+                return default;
+
+            var maxNameLength = (int)Math.Min(128UL, (ulong)sizeOfImage - nameRva);
+            if (!TryReadRemoteString(hProcess, IntPtr.Add(moduleBase, (int)nameRva), maxNameLength, out var name))
+                return default;
+
             if (!string.Equals(name, funcName, StringComparison.Ordinal))
                 continue;
 
@@ -615,7 +635,7 @@ internal sealed class ManualMapInjector : InjectorBase
         var numberOfFunctions = ReadU32(directory, 20);
         var addressOfFunctions = ReadU32(directory, 28);
 
-        if (numberOfFunctions > 0x10000 ||
+        if (numberOfFunctions == 0 || numberOfFunctions > 0x10000 ||
             !RangeInImage(addressOfFunctions, (ulong)numberOfFunctions * 4, sizeOfImage))
             return default;
 
@@ -647,7 +667,13 @@ internal sealed class ManualMapInjector : InjectorBase
             if (depth >= 8)
                 return default;
 
-            var forwarder = ReadRemoteString(hProcess, IntPtr.Add(moduleBase, (int)funcRva), 128).Trim();
+            var forwarderEnd = (ulong)directoryRva + directorySize;
+            var maxForwarderLength = (int)Math.Min(128UL, forwarderEnd - funcRva);
+            if (maxForwarderLength <= 0 ||
+                !TryReadRemoteString(hProcess, IntPtr.Add(moduleBase, (int)funcRva), maxForwarderLength, out var forwarder))
+                return default;
+
+            forwarder = forwarder.Trim();
             var dot = forwarder.IndexOf('.');
 
             // A malformed forwarder must NOT fall through to moduleBase + funcRva,
@@ -688,17 +714,39 @@ internal sealed class ManualMapInjector : InjectorBase
 
     private static (uint Rva, uint Size, uint SizeOfImage) GetExportDirectory(IntPtr hProcess, IntPtr moduleBase)
     {
+        // Ask PSAPI for the mapped module extent first. Header values are
+        // untrusted, so they cannot be used to authorize reads outside the
+        // actual allocation returned by the loader.
+        if (!NativeMethods.GetModuleInformation(hProcess, moduleBase, out var moduleInfo,
+                (uint)System.Runtime.InteropServices.Marshal.SizeOf<MODULEINFO>()) ||
+            moduleInfo.lpBaseOfDll != moduleBase || moduleInfo.SizeOfImage == 0 ||
+            moduleInfo.SizeOfImage > int.MaxValue)
+            return (0, 0, 0);
+
+        var sizeOfImage = moduleInfo.SizeOfImage;
+        if (sizeOfImage < 0x40)
+            return (0, 0, 0);
+
         var dos = ReadRemote(hProcess, moduleBase, 0x40);
         if (ReadU16(dos, 0) != 0x5A4D)
             return (0, 0, 0);
 
-        var lfanew = (int)ReadU32(dos, 0x3C);
-        var nt = ReadRemote(hProcess, IntPtr.Add(moduleBase, lfanew), 0x108);
-        if (ReadU32(nt, 0) != 0x00004550)
+        var lfanew = ReadU32(dos, 0x3C);
+        const int ntBytesNeeded = 0x18 + 120; // PE headers through export data directory
+        if ((ulong)lfanew + ntBytesNeeded > sizeOfImage)
             return (0, 0, 0);
 
+        var nt = ReadRemote(hProcess, IntPtr.Add(moduleBase, checked((int)lfanew)), ntBytesNeeded);
+        if (ReadU32(nt, 0) != 0x00004550 || ReadU16(nt, 4) != 0x8664)
+            return (0, 0, 0);
+
+        var sizeOfOptionalHeader = ReadU16(nt, 20);
         var optional = 0x18;
-        var sizeOfImage = ReadU32(nt, optional + 56);
+        if (sizeOfOptionalHeader < 120 || ReadU16(nt, optional) != 0x20B ||
+            (ulong)lfanew + 24UL + sizeOfOptionalHeader > sizeOfImage ||
+            ReadU32(nt, optional + 56) != sizeOfImage)
+            return (0, 0, sizeOfImage);
+
         var directoryRva = ReadU32(nt, optional + 112);
         var directorySize = ReadU32(nt, optional + 116);
 
@@ -716,7 +764,10 @@ internal sealed class ManualMapInjector : InjectorBase
     /// inside an image of <paramref name="sizeOfImage"/> (overflow-safe).
     /// </summary>
     private static bool RangeInImage(uint rva, ulong length, uint sizeOfImage)
-        => rva != 0 && rva < sizeOfImage && (ulong)rva + length <= sizeOfImage;
+        => rva != 0 && rva < sizeOfImage && length <= (ulong)sizeOfImage - rva;
+
+    private static bool TableRangeInImage(uint rva, ulong length, uint sizeOfImage)
+        => length == 0 || RangeInImage(rva, length, sizeOfImage);
 
     private static void ProtectSections(PeImage pe, IntPtr hProcess, IntPtr remoteBase)
     {
@@ -1015,13 +1066,23 @@ internal sealed class ManualMapInjector : InjectorBase
         return buffer;
     }
 
-    private static string ReadRemoteString(IntPtr hProcess, IntPtr address, int max)
+    private static bool TryReadRemoteString(IntPtr hProcess, IntPtr address, int max, out string value)
     {
+        value = string.Empty;
+        if (max <= 0)
+            return false;
+
         var buffer = new byte[max];
-        NativeMethods.ReadProcessMemory(hProcess, address, buffer, (UIntPtr)max, out _);
-        var end = Array.IndexOf(buffer, (byte)0);
+        NativeMethods.ReadProcessMemory(hProcess, address, buffer, (UIntPtr)max, out var bytesRead);
+        if (bytesRead.ToUInt64() == 0)
+            return false;
+
+        var available = (int)Math.Min((ulong)max, bytesRead.ToUInt64());
+        var end = Array.IndexOf(buffer, (byte)0, 0, available);
         if (end < 0)
-            end = buffer.Length;
-        return Encoding.ASCII.GetString(buffer, 0, end);
+            return false;
+
+        value = Encoding.ASCII.GetString(buffer, 0, end);
+        return true;
     }
 }

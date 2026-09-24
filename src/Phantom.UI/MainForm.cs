@@ -457,6 +457,10 @@ public sealed class MainForm : Form
 
         Log($"Injecting {enabled.Count} DLL(s) into {process.Name} (PID {process.Pid}) using {job.Method}...");
 
+        // Capture the identity before opening the target for injection. If the
+        // PID is reused while the operation is in flight, never associate the
+        // returned base with the replacement process.
+        var targetStartTime = GetProcessStartTime(process.Pid);
         var succeeded = 0;
         foreach (var (dllPath, _) in enabled)
         {
@@ -485,9 +489,21 @@ public sealed class MainForm : Form
                     // Keep the authoritative base for export calls (works for
                     // manual-mapped and hidden modules), scoped to this exact
                     // process instance so a PID later reused cannot collide.
-                    lock (_injected)
-                        _injected[InjectedKey(process.Pid, dllPath)] =
-                            new InjectedModule(result.ModuleBase, job.ErasePe, GetProcessStartTime(process.Pid));
+                    var currentStartTime = GetProcessStartTime(process.Pid);
+                    var injectedKey = InjectedKey(process.Pid, dllPath);
+                    if (targetStartTime != DateTime.MinValue && currentStartTime == targetStartTime)
+                    {
+                        lock (_injected)
+                            _injected[injectedKey] =
+                                new InjectedModule(result.ModuleBase, job.ErasePe, targetStartTime);
+                    }
+                    else
+                    {
+                        lock (_injected)
+                            _injected.Remove(injectedKey);
+
+                        Log($"  [WARN] Could not verify that PID {process.Pid} is still the same process; its module base was not cached.");
+                    }
 
                     Log($"  [OK] {Path.GetFileName(dllPath)} -> base 0x{result.ModuleBase.ToInt64():X}" +
                         (result.RemoteThreadId != 0 ? $", TID {result.RemoteThreadId}" : ""));
@@ -590,15 +606,22 @@ public sealed class MainForm : Form
         // for the same process instance (PID + start time guard against reuse).
         var moduleBase = IntPtr.Zero;
         var headersErased = false;
+        var processStartTime = GetProcessStartTime(process.Pid);
+        var injectedKey = InjectedKey(process.Pid, entry.Path);
         lock (_injected)
         {
-            if (_injected.TryGetValue(InjectedKey(process.Pid, entry.Path), out var injected) &&
-                injected.Base != IntPtr.Zero &&
-                (injected.ProcessStartTime == DateTime.MinValue ||
-                 injected.ProcessStartTime == GetProcessStartTime(process.Pid)))
+            if (_injected.TryGetValue(injectedKey, out var injected))
             {
-                moduleBase = injected.Base;
-                headersErased = injected.HeadersErased;
+                if (injected.Base != IntPtr.Zero && processStartTime != DateTime.MinValue &&
+                    injected.ProcessStartTime == processStartTime)
+                {
+                    moduleBase = injected.Base;
+                    headersErased = injected.HeadersErased;
+                }
+                else
+                {
+                    _injected.Remove(injectedKey);
+                }
             }
         }
 

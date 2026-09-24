@@ -115,7 +115,7 @@ internal sealed unsafe class ThreadHijackInjector : InjectorBase
     /// thread is unsuitable (stack state unknown or too small) so the caller can
     /// try the next one; otherwise a terminal result.
     /// </summary>
-    private static InjectionResult? TryHijackThread(uint pid, IntPtr hProcess, IntPtr hThread,
+    private InjectionResult? TryHijackThread(uint pid, IntPtr hProcess, IntPtr hThread,
         uint threadId, string dllPath, InjectionOptions options)
     {
         IntPtr contextBuffer = IntPtr.Zero;

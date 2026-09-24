@@ -79,7 +79,11 @@ internal sealed class PeImage
         SizeOfImage = ReadU32(optional + 56);
         SizeOfHeaders = ReadU32(optional + 60);
 
-        if (SizeOfImage == 0 || SizeOfHeaders > SizeOfImage || SizeOfHeaders > raw.Length)
+        // The mapper uses int offsets for its local image buffer and remote
+        // pointer arithmetic. Reject larger images rather than letting a uint
+        // RVA wrap when converted to an int.
+        if (SizeOfImage == 0 || SizeOfImage > int.MaxValue ||
+            SizeOfHeaders > SizeOfImage || SizeOfHeaders > raw.Length)
             throw new BadImageFormatException("The image size or header size is invalid.");
         if (AddressOfEntryPoint != 0 && AddressOfEntryPoint >= SizeOfImage)
             throw new BadImageFormatException("The entry point is outside the mapped image.");
@@ -170,13 +174,20 @@ internal sealed class PeImage
     public int RvaToOffset(uint rva)
     {
         if (rva < SizeOfHeaders)
-            return (int)rva;
+            return rva < Raw.Length ? (int)rva : -1;
 
         foreach (var s in Sections)
         {
-            var size = Math.Max(s.VirtualSize, s.SizeOfRawData);
-            if (rva >= s.VirtualAddress && (ulong)rva < (ulong)s.VirtualAddress + size)
-                return (int)(s.PointerToRawData + (rva - s.VirtualAddress));
+            if (rva < s.VirtualAddress)
+                continue;
+
+            var delta = (ulong)rva - s.VirtualAddress;
+            if (delta >= s.SizeOfRawData)
+                continue;
+
+            var rawOffset = (ulong)s.PointerToRawData + delta;
+            if (rawOffset < (ulong)Raw.Length)
+                return (int)rawOffset;
         }
 
         return -1;

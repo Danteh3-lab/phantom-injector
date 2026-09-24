@@ -128,11 +128,12 @@ public static class ExportCaller
         {
             var pe = new PeImage(File.ReadAllBytes(dllPath));
             var export = pe.Directory(PeImage.DirectoryExport);
-            if (export.VirtualAddress == 0 || export.Size < 40)
+            if (export.VirtualAddress == 0 || export.Size < 40 ||
+                (ulong)export.VirtualAddress + export.Size > pe.SizeOfImage)
                 return false;
 
             var dirOff = pe.RvaToOffset(export.VirtualAddress);
-            if (dirOff < 0 || dirOff + 40 > pe.Raw.Length)
+            if (!RawRangeFits(pe.Raw, dirOff, 40))
                 return false;
 
             var numberOfFunctions = ReadU32(pe.Raw, dirOff + 20);
@@ -141,13 +142,19 @@ public static class ExportCaller
             var addressOfNames = ReadU32(pe.Raw, dirOff + 32);
             var addressOfNameOrdinals = ReadU32(pe.Raw, dirOff + 36);
 
-            if (numberOfNames > 0x10000 || numberOfFunctions > 0x10000)
+            if (numberOfFunctions == 0 ||
+                numberOfNames > 0x10000 || numberOfFunctions > 0x10000)
+                return false;
+
+            var funcsOff = pe.RvaToOffset(addressOfFunctions);
+            if (!RawRangeFits(pe.Raw, funcsOff, (ulong)numberOfFunctions * 4))
                 return false;
 
             var namesOff = pe.RvaToOffset(addressOfNames);
             var ordinalsOff = pe.RvaToOffset(addressOfNameOrdinals);
-            var funcsOff = pe.RvaToOffset(addressOfFunctions);
-            if (namesOff < 0 || ordinalsOff < 0 || funcsOff < 0)
+            if (numberOfNames > 0 &&
+                (!RawRangeFits(pe.Raw, namesOff, (ulong)numberOfNames * 4) ||
+                 !RawRangeFits(pe.Raw, ordinalsOff, (ulong)numberOfNames * 2)))
                 return false;
 
             for (var i = 0; i < numberOfNames; i++)
@@ -358,6 +365,10 @@ public static class ExportCaller
 
     private static uint ReadU32(byte[] buffer, int offset)
         => offset >= 0 && offset + 4 <= buffer.Length ? BinaryPrimitives.ReadUInt32LittleEndian(buffer.AsSpan(offset, 4)) : 0;
+
+    private static bool RawRangeFits(byte[] buffer, int offset, ulong length)
+        => offset >= 0 && (ulong)offset <= (ulong)buffer.Length &&
+           length <= (ulong)buffer.Length - (ulong)offset;
 
     private static string ReadAscii(byte[] buffer, int offset)
     {
