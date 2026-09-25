@@ -6,7 +6,9 @@ public enum InjectionMethod
     LdrLoadDll,
     LdrpLoadDll,
     ThreadHijack,
-    ManualMap
+    ManualMap,
+    DllHollowing,
+    ModuleStomping
 }
 
 /// <summary>

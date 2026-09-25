@@ -1,3 +1,4 @@
+using System.IO;
 using Phantom.Core.Processes;
 
 namespace Phantom.Core.Injection;
@@ -26,10 +27,19 @@ public static class Injector
             InjectionMethod.LdrLoadDll => new LdrLoadDllInjector(),
             InjectionMethod.ThreadHijack => new ThreadHijackInjector(),
             InjectionMethod.ManualMap => new ManualMapInjector(),
+            InjectionMethod.DllHollowing => new DllHollowingInjector(),
+            InjectionMethod.ModuleStomping => new ModuleStompingInjector(),
             _ => new StandardInjector()
         };
 
         var result = injector.Inject(pid, dllPath, options);
+
+        // Defense in depth (finding 8): never run PE erasure or PEB unlinking
+        // against a non-image base. A DllMain boolean (0/1) must never reach here,
+        // but a low sentinel would corrupt the target if passed to post-inject.
+        if (result.Success && result.ModuleBase.ToInt64() < 0x10000)
+            return InjectionResult.Fail(options.Method, dllPath,
+                $"Injection reported an invalid module base 0x{result.ModuleBase.ToInt64():X}; refusing post-inject steps.");
 
         if (result.Success && (options.ErasePeHeaders || options.HideModule))
         {

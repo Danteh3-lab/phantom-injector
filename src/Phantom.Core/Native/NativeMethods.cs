@@ -14,6 +14,7 @@ internal static class NativeConstants
     public const uint PROCESS_VM_OPERATION = 0x0008;
     public const uint PROCESS_VM_READ = 0x0010;
     public const uint PROCESS_VM_WRITE = 0x0020;
+    public const uint PROCESS_SUSPEND_RESUME = 0x0800;
 
     public const uint MEM_COMMIT = 0x00001000;
     public const uint MEM_RESERVE = 0x00002000;
@@ -65,6 +66,22 @@ internal static class NativeConstants
     public const uint DLL_PROCESS_DETACH = 0;
 
     public const uint MEM_IMAGE = 0x1000000;
+
+    public const uint SEC_IMAGE = 0x1000000;
+    public const uint SEC_IMAGE_NO_EXECUTE = 0x11000000;
+    public const uint SEC_COMMIT = 0x8000000;
+    public const uint SEC_RESERVE = 0x4000000;
+    public const uint SEC_LARGE_PAGES = 0x80000000;
+
+    public const uint SECTION_QUERY = 0x0001;
+    public const uint SECTION_MAP_READ = 0x0004;
+    public const uint SECTION_MAP_WRITE = 0x0002;
+    public const uint SECTION_MAP_EXECUTE = 0x0008;
+    public const uint SECTION_EXTEND_SIZE = 0x0010;
+    public const uint SECTION_MAP_EXECUTE_EXPLICIT = 0x0020;
+    public const uint SECTION_ALL_ACCESS = 0x10000000;
+
+    public const uint OBJ_CASE_INSENSITIVE = 0x00000040;
 
     public const ushort IMAGE_FILE_MACHINE_AMD64 = 0x8664;
 
@@ -258,6 +275,9 @@ internal static class NativeMethods
     internal static extern bool VirtualProtectEx(IntPtr hProcess, IntPtr lpAddress, UIntPtr dwSize, uint flNewProtect, out uint lpflOldProtect);
 
     [DllImport("kernel32.dll", SetLastError = true)]
+    internal static extern UIntPtr VirtualQueryEx(IntPtr hProcess, IntPtr lpAddress, out MEMORY_BASIC_INFORMATION lpBuffer, UIntPtr dwLength);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
     [return: MarshalAs(UnmanagedType.Bool)]
     internal static extern bool WriteProcessMemory(IntPtr hProcess, IntPtr lpBaseAddress, byte[] lpBuffer, UIntPtr nSize, out UIntPtr lpNumberOfBytesWritten);
 
@@ -437,6 +457,48 @@ internal static class NativeMethods
 
     [DllImport("ntdll.dll")]
     internal static extern int NtQueryInformationThread(IntPtr threadHandle, int threadInformationClass, ref THREAD_BASIC_INFORMATION threadInformation, int threadInformationLength, out int returnLength);
+
+    [DllImport("ntdll.dll", SetLastError = true)]
+    internal static extern int NtAllocateVirtualMemory(IntPtr ProcessHandle, ref IntPtr BaseAddress, IntPtr ZeroBits, ref UIntPtr RegionSize, uint AllocationType, uint Protect);
+
+    [DllImport("ntdll.dll", SetLastError = true)]
+    internal static extern int NtProtectVirtualMemory(IntPtr ProcessHandle, ref IntPtr BaseAddress, ref UIntPtr RegionSize, uint NewProtect, out uint OldProtect);
+
+    [DllImport("ntdll.dll", SetLastError = true)]
+    internal static extern int NtWriteVirtualMemory(IntPtr ProcessHandle, IntPtr BaseAddress, IntPtr Buffer, UIntPtr BufferSize, out UIntPtr NumberOfBytesWritten);
+
+    [DllImport("ntdll.dll", SetLastError = true)]
+    internal static extern int NtReadVirtualMemory(IntPtr ProcessHandle, IntPtr BaseAddress, IntPtr Buffer, UIntPtr BufferSize, out UIntPtr NumberOfBytesRead);
+
+    [DllImport("ntdll.dll", SetLastError = true)]
+    internal static extern int NtCreateThreadEx(out IntPtr ThreadHandle, uint DesiredAccess, IntPtr ObjectAttributes, IntPtr ProcessHandle, IntPtr StartRoutine, IntPtr Argument, uint CreateFlags, IntPtr ZeroBits, IntPtr StackSize, IntPtr MaximumStackSize, IntPtr AttributeList);
+
+    [DllImport("ntdll.dll", SetLastError = true)]
+    internal static extern int NtOpenProcess(out IntPtr ProcessHandle, uint DesiredAccess, IntPtr ObjectAttributes, IntPtr ClientId);
+
+    [DllImport("ntdll.dll", SetLastError = true)]
+    internal static extern int NtCreateSection(out IntPtr SectionHandle, uint DesiredAccess, IntPtr ObjectAttributes, ref long MaximumSize, uint SectionPageProtection, uint AllocationAttributes, IntPtr FileHandle);
+
+    [DllImport("ntdll.dll", SetLastError = true)]
+    internal static extern int NtMapViewOfSection(IntPtr SectionHandle, IntPtr ProcessHandle, ref IntPtr BaseAddress, IntPtr ZeroBits, UIntPtr CommitSize, ref long SectionOffset, out UIntPtr ViewSize, uint InheritDisposition, uint AllocationType, uint Win32Protect);
+
+    [DllImport("ntdll.dll", SetLastError = true)]
+    internal static extern int NtUnmapViewOfSection(IntPtr ProcessHandle, IntPtr BaseAddress);
+
+    [DllImport("ntdll.dll", SetLastError = true)]
+    internal static extern int NtGetContextThread(IntPtr ThreadHandle, IntPtr Context);
+
+    [DllImport("ntdll.dll", SetLastError = true)]
+    internal static extern int NtSetContextThread(IntPtr ThreadHandle, IntPtr Context);
+
+    [DllImport("ntdll.dll", SetLastError = true)]
+    internal static extern int NtSuspendThread(IntPtr ThreadHandle, out uint PreviousSuspendCount);
+
+    [DllImport("ntdll.dll", SetLastError = true)]
+    internal static extern int NtResumeThread(IntPtr ThreadHandle, out uint PreviousSuspendCount);
+
+    [DllImport("ntdll.dll", SetLastError = true)]
+    internal static extern int NtClose(IntPtr Handle);
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -457,4 +519,22 @@ internal struct MODULEINFO
     public IntPtr lpBaseOfDll;
     public uint SizeOfImage;
     public IntPtr EntryPoint;
+}
+
+/// <summary>
+/// Win64 MEMORY_BASIC_INFORMATION (Windows 10+ layout with PartitionId,
+/// 0x30 bytes). Only BaseAddress, RegionSize and Protect are consumed.
+/// </summary>
+[StructLayout(LayoutKind.Sequential)]
+internal struct MEMORY_BASIC_INFORMATION
+{
+    public IntPtr BaseAddress;
+    public IntPtr AllocationBase;
+    public uint AllocationProtect;
+    public ushort PartitionId;
+    public ushort AlignmentPadding;
+    public ulong RegionSize;
+    public uint State;
+    public uint Protect;
+    public uint Type;
 }
