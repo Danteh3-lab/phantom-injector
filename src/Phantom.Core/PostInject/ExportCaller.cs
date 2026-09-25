@@ -39,9 +39,12 @@ public static class ExportCaller
         var indeterminate = false;
         try
         {
-            hProcess = NativeMethods.OpenProcess(Access, false, pid);
-            if (hProcess == IntPtr.Zero)
-                return new ExportCallResult { Success = false, Error = "OpenProcess failed: " + Win32Error.LastError() };
+            var openStatus = DirectSyscalls.NtOpenProcessByPid(out hProcess, Access, pid);
+            if (openStatus != 0 || hProcess == IntPtr.Zero)
+            {
+                hProcess = IntPtr.Zero;
+                return new ExportCallResult { Success = false, Error = $"OpenProcess failed: 0x{openStatus:X8}" };
+            }
 
             var getProcAddress = ResolveRemoteExport(pid, "kernel32.dll", "GetProcAddress");
             var namePtr = AllocWrite(hProcess, Encoding.ASCII.GetBytes(functionName + "\0"), allocations);
@@ -98,9 +101,12 @@ public static class ExportCaller
         var indeterminate = false;
         try
         {
-            hProcess = NativeMethods.OpenProcess(Access, false, pid);
-            if (hProcess == IntPtr.Zero)
-                return new ExportCallResult { Success = false, Error = "OpenProcess failed: " + Win32Error.LastError() };
+            var openStatusByAddr = DirectSyscalls.NtOpenProcessByPid(out hProcess, Access, pid);
+            if (openStatusByAddr != 0 || hProcess == IntPtr.Zero)
+            {
+                hProcess = IntPtr.Zero;
+                return new ExportCallResult { Success = false, Error = $"OpenProcess failed: 0x{openStatusByAddr:X8}" };
+            }
 
             if (functionAddress == IntPtr.Zero)
                 return new ExportCallResult { Success = false, Error = "The export address is null." };
@@ -237,7 +243,7 @@ public static class ExportCaller
         if (!indeterminate)
         {
             foreach (var alloc in allocations)
-                NativeMethods.VirtualFreeEx(hProcess, alloc, UIntPtr.Zero, NativeConstants.MEM_RELEASE);
+                DirectSyscalls.NtFreeVirtualMemory(hProcess, alloc);
         }
 
         NativeMethods.CloseHandle(hProcess);
@@ -271,8 +277,10 @@ public static class ExportCaller
     private static bool RunThread(IntPtr hProcess, IntPtr start, int timeoutMs, out bool indeterminate)
     {
         indeterminate = false;
-        var hThread = NativeMethods.CreateRemoteThread(hProcess, IntPtr.Zero, UIntPtr.Zero, start, IntPtr.Zero, 0, out _);
-        if (hThread == IntPtr.Zero)
+        var createStatus = DirectSyscalls.NtCreateThreadEx(out var hThread, NativeConstants.THREAD_ALL_ACCESS,
+            IntPtr.Zero, hProcess, start, IntPtr.Zero, 0,
+            IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+        if (createStatus != 0 || hThread == IntPtr.Zero)
             return false;
 
         try
@@ -294,22 +302,24 @@ public static class ExportCaller
 
     private static IntPtr AllocWrite(IntPtr hProcess, byte[] data, List<IntPtr> allocations, uint protect = NativeConstants.PAGE_READWRITE)
     {
-        var address = NativeMethods.VirtualAllocEx(hProcess, IntPtr.Zero, (UIntPtr)(uint)data.Length,
-            NativeConstants.MEM_COMMIT | NativeConstants.MEM_RESERVE, protect);
-        if (address == IntPtr.Zero)
-            throw new InvalidOperationException("VirtualAllocEx failed: " + Win32Error.LastError());
+        var baseAddr = IntPtr.Zero;
+        var region = (UIntPtr)(uint)data.Length;
+        var allocStatus = DirectSyscalls.NtAllocateVirtualMemory(hProcess, ref baseAddr, IntPtr.Zero,
+            ref region, NativeConstants.MEM_COMMIT | NativeConstants.MEM_RESERVE, protect);
+        if (allocStatus != 0 || baseAddr == IntPtr.Zero)
+            throw new InvalidOperationException($"NtAllocateVirtualMemory failed: 0x{allocStatus:X8}");
 
-        allocations.Add(address);
-        if (!NativeMethods.WriteProcessMemory(hProcess, address, data, (UIntPtr)(uint)data.Length, out var written) ||
+        allocations.Add(baseAddr);
+        if (DirectSyscalls.NtWriteVirtualMemory(hProcess, baseAddr, data, out var written) != 0 ||
             written.ToUInt64() != (ulong)data.Length)
-            throw new InvalidOperationException("WriteProcessMemory failed: " + Win32Error.LastError());
-        return address;
+            throw new InvalidOperationException("NtWriteVirtualMemory failed.");
+        return baseAddr;
     }
 
     private static bool TryReadInt64(IntPtr hProcess, IntPtr address, out long value)
     {
         var buffer = new byte[8];
-        if (!NativeMethods.ReadProcessMemory(hProcess, address, buffer, (UIntPtr)8, out var read) ||
+        if (DirectSyscalls.NtReadVirtualMemory(hProcess, address, buffer, out var read) != 0 ||
             read.ToUInt64() != 8)
         {
             value = 0;

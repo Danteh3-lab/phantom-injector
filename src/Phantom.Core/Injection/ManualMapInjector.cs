@@ -60,15 +60,19 @@ internal sealed class ManualMapInjector : InjectorBase
             var raw = File.ReadAllBytes(dllPath);
             var pe = new PeImage(raw);
 
-            hProcess = NativeMethods.OpenProcess(InjectionAccess, false, pid);
-            if (hProcess == IntPtr.Zero)
-                return InjectionResult.Fail(Method, dllPath, "OpenProcess failed: " + Win32Error.LastError(), NativeMethods.GetLastError());
+            try
+            {
+                hProcess = OpenRemoteProcess(pid, InjectionAccess);
+            }
+            catch (Exception ex)
+            {
+                return InjectionResult.Fail(Method, dllPath, "OpenProcess failed: " + ex.Message);
+            }
 
             var image = BuildImage(pe);
 
             // Try to honour the preferred base first so relocations are unnecessary.
-            remoteBase = NativeMethods.VirtualAllocEx(hProcess, (IntPtr)(long)pe.ImageBase, (UIntPtr)pe.SizeOfImage,
-                NativeConstants.MEM_COMMIT | NativeConstants.MEM_RESERVE, NativeConstants.PAGE_EXECUTE_READWRITE);
+            remoteBase = TryAllocateAt(hProcess, (IntPtr)(long)pe.ImageBase, (int)pe.SizeOfImage);
             if (remoteBase == IntPtr.Zero)
                 remoteBase = AllocateRemote(hProcess, (int)pe.SizeOfImage, NativeConstants.PAGE_EXECUTE_READWRITE);
 
@@ -177,7 +181,7 @@ internal sealed class ManualMapInjector : InjectorBase
             }
 
             if (!init.Created)
-                return FailMapping("CreateRemoteThread failed: " + Win32Error.LastError());
+                return FailMapping("NtCreateThreadEx failed in the target.");
 
             if (!TryReadRemoteInt64(hProcess, completionAddress, out var completion) || completion == 0)
             {
@@ -290,7 +294,7 @@ internal sealed class ManualMapInjector : InjectorBase
 
             if (!exec.Created)
             {
-                error = "CreateRemoteThread failed while releasing a dependency";
+                error = "NtCreateThreadEx failed while releasing a dependency";
                 return false;
             }
 
@@ -769,6 +773,25 @@ internal sealed class ManualMapInjector : InjectorBase
     private static bool TableRangeInImage(uint rva, ulong length, uint sizeOfImage)
         => length == 0 || RangeInImage(rva, length, sizeOfImage);
 
+    private static IntPtr TryAllocateAt(IntPtr hProcess, IntPtr preferredBase, int size)
+    {
+        var baseAddr = preferredBase;
+        var region = (UIntPtr)(uint)size;
+        var status = DirectSyscalls.NtAllocateVirtualMemory(hProcess, ref baseAddr, IntPtr.Zero,
+            ref region, NativeConstants.MEM_COMMIT | NativeConstants.MEM_RESERVE,
+            NativeConstants.PAGE_EXECUTE_READWRITE);
+        return status == 0 ? baseAddr : IntPtr.Zero;
+    }
+
+    private static void ProtectRemote(IntPtr hProcess, IntPtr address, int size, uint protect, string what)
+    {
+        var baseAddr = address;
+        var region = (UIntPtr)(uint)size;
+        var status = DirectSyscalls.NtProtectVirtualMemory(hProcess, ref baseAddr, ref region, protect, out _);
+        if (status != 0)
+            throw new InvalidOperationException($"NtProtectVirtualMemory failed for {what}: 0x{status:X8}");
+    }
+
     private static void ProtectSections(PeImage pe, IntPtr hProcess, IntPtr remoteBase)
     {
         foreach (var s in pe.Sections)
@@ -781,14 +804,11 @@ internal sealed class ManualMapInjector : InjectorBase
             if (size == 0)
                 continue;
 
-            if (!NativeMethods.VirtualProtectEx(hProcess, IntPtr.Add(remoteBase, (int)s.VirtualAddress), (UIntPtr)size,
-                    PeImage.CharacteristicsToProtection(s.Characteristics), out _))
-                throw new InvalidOperationException($"VirtualProtectEx failed for section '{s.Name}': " + Win32Error.LastError());
+            ProtectRemote(hProcess, IntPtr.Add(remoteBase, (int)s.VirtualAddress), (int)size,
+                PeImage.CharacteristicsToProtection(s.Characteristics), $"section '{s.Name}'");
         }
 
-        if (!NativeMethods.VirtualProtectEx(hProcess, remoteBase, (UIntPtr)pe.SizeOfHeaders,
-                NativeConstants.PAGE_READONLY, out _))
-            throw new InvalidOperationException("VirtualProtectEx failed for the PE headers: " + Win32Error.LastError());
+        ProtectRemote(hProcess, remoteBase, (int)pe.SizeOfHeaders, NativeConstants.PAGE_READONLY, "the PE headers");
     }
 
     /// <summary>
@@ -1061,8 +1081,9 @@ internal sealed class ManualMapInjector : InjectorBase
     private static byte[] ReadRemote(IntPtr hProcess, IntPtr address, int size)
     {
         var buffer = new byte[size];
-        if (!NativeMethods.ReadProcessMemory(hProcess, address, buffer, (UIntPtr)size, out _))
-            throw new InvalidOperationException($"ReadProcessMemory at 0x{address.ToInt64():X} failed: " + Win32Error.LastError());
+        var status = DirectSyscalls.NtReadVirtualMemory(hProcess, address, buffer, out var read);
+        if (status != 0 || read.ToUInt64() != (ulong)size)
+            throw new InvalidOperationException($"NtReadVirtualMemory at 0x{address.ToInt64():X} failed: 0x{status:X8}");
         return buffer;
     }
 
@@ -1073,7 +1094,8 @@ internal sealed class ManualMapInjector : InjectorBase
             return false;
 
         var buffer = new byte[max];
-        NativeMethods.ReadProcessMemory(hProcess, address, buffer, (UIntPtr)max, out var bytesRead);
+        if (DirectSyscalls.NtReadVirtualMemory(hProcess, address, buffer, out var bytesRead) != 0)
+            return false;
         if (bytesRead.ToUInt64() == 0)
             return false;
 

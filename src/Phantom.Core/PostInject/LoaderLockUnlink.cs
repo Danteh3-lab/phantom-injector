@@ -1,4 +1,3 @@
-using System.Runtime.InteropServices;
 using Phantom.Core.Native;
 
 namespace Phantom.Core.PostInject;
@@ -42,13 +41,17 @@ internal static class LoaderLockUnlink
         const int regionSize = 0x200;
         const int stubOffset = 16;
 
-        var region = NativeMethods.VirtualAllocEx(hProcess, IntPtr.Zero, (UIntPtr)regionSize,
-            NativeConstants.MEM_COMMIT | NativeConstants.MEM_RESERVE, NativeConstants.PAGE_EXECUTE_READWRITE);
-        if (region == IntPtr.Zero)
+        var regionBase = IntPtr.Zero;
+        var regionSizeAlloc = (UIntPtr)regionSize;
+        var allocStatus = DirectSyscalls.NtAllocateVirtualMemory(hProcess, ref regionBase, IntPtr.Zero,
+            ref regionSizeAlloc, NativeConstants.MEM_COMMIT | NativeConstants.MEM_RESERVE,
+            NativeConstants.PAGE_EXECUTE_READWRITE);
+        if (allocStatus != 0 || regionBase == IntPtr.Zero)
         {
-            error = "VirtualAllocEx failed: " + Win32Error.LastError();
+            error = $"NtAllocateVirtualMemory failed: 0x{allocStatus:X8}";
             return false;
         }
+        var region = regionBase;
 
         var keepMapped = false;
         try
@@ -56,10 +59,10 @@ internal static class LoaderLockUnlink
             var statusAddress = region;
             var stub = BuildStub(listHead, moduleBase, lockFunction, unlockFunction, statusAddress);
 
-            if (!NativeMethods.WriteProcessMemory(hProcess, statusAddress, new byte[8], (UIntPtr)8, out _) ||
-                !NativeMethods.WriteProcessMemory(hProcess, IntPtr.Add(region, stubOffset), stub, (UIntPtr)(uint)stub.Length, out _))
+            if (DirectSyscalls.NtWriteVirtualMemory(hProcess, statusAddress, new byte[8], out _) != 0 ||
+                DirectSyscalls.NtWriteVirtualMemory(hProcess, IntPtr.Add(region, stubOffset), stub, out _) != 0)
             {
-                error = "WriteProcessMemory failed: " + Win32Error.LastError();
+                error = "NtWriteVirtualMemory failed.";
                 return false;
             }
 
@@ -73,11 +76,12 @@ internal static class LoaderLockUnlink
                 return false;
             }
 
-            var hThread = NativeMethods.CreateRemoteThread(hProcess, IntPtr.Zero, UIntPtr.Zero,
-                IntPtr.Add(region, stubOffset), IntPtr.Zero, 0, out _);
-            if (hThread == IntPtr.Zero)
+            var createStatus = DirectSyscalls.NtCreateThreadEx(out var hThread, NativeConstants.THREAD_ALL_ACCESS,
+                IntPtr.Zero, hProcess, IntPtr.Add(region, stubOffset), IntPtr.Zero, 0,
+                IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+            if (createStatus != 0 || hThread == IntPtr.Zero)
             {
-                error = "CreateRemoteThread failed: " + Win32Error.LastError();
+                error = $"NtCreateThreadEx failed: 0x{createStatus:X8}";
                 return false;
             }
 
@@ -93,7 +97,7 @@ internal static class LoaderLockUnlink
             }
 
             var statusBuffer = new byte[8];
-            var status = NativeMethods.ReadProcessMemory(hProcess, statusAddress, statusBuffer, (UIntPtr)8, out var read) &&
+            var status = DirectSyscalls.NtReadVirtualMemory(hProcess, statusAddress, statusBuffer, out var read) == 0 &&
                          read.ToUInt64() == 8
                 ? BitConverter.ToInt64(statusBuffer, 0)
                 : 0;
@@ -119,7 +123,7 @@ internal static class LoaderLockUnlink
         finally
         {
             if (!keepMapped)
-                NativeMethods.VirtualFreeEx(hProcess, region, UIntPtr.Zero, NativeConstants.MEM_RELEASE);
+                DirectSyscalls.NtFreeVirtualMemory(hProcess, region);
         }
     }
 
@@ -127,14 +131,12 @@ internal static class LoaderLockUnlink
     {
         listHead = IntPtr.Zero;
 
-        var pbi = new PROCESS_BASIC_INFORMATION();
-        var status = NativeMethods.NtQueryInformationProcess(hProcess, 0, ref pbi,
-            Marshal.SizeOf<PROCESS_BASIC_INFORMATION>(), out _);
-        if (status != 0 || pbi.PebBaseAddress == IntPtr.Zero)
+        if (DirectSyscalls.NtQueryPeb(hProcess, out var peb) != 0 || peb == IntPtr.Zero)
             return false;
 
         var buffer = new byte[8];
-        if (!NativeMethods.ReadProcessMemory(hProcess, IntPtr.Add(pbi.PebBaseAddress, PebLdrOffset), buffer, (UIntPtr)8, out _))
+        if (DirectSyscalls.NtReadVirtualMemory(hProcess, IntPtr.Add(peb, PebLdrOffset), buffer, out var read) != 0 ||
+            read.ToUInt64() != 8)
             return false;
 
         var ldr = (IntPtr)BitConverter.ToInt64(buffer, 0);

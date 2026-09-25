@@ -331,13 +331,15 @@ internal static class NativeMethods
     internal static extern bool FlushInstructionCache(IntPtr hProcess, IntPtr lpBaseAddress, UIntPtr dwSize);
 
     /// <summary>
-    /// Flushes generated code and throws if the flush fails, so the caller never
-    /// executes instructions that may not be visible to the processor.
+    /// Flushes generated code via direct NtFlushInstructionCache syscall and
+    /// throws if the flush fails, so the caller never executes instructions
+    /// that may not be visible to the processor.
     /// </summary>
     internal static void FlushInstructionCacheChecked(IntPtr hProcess, IntPtr address, int size)
     {
-        if (!FlushInstructionCache(hProcess, address, (UIntPtr)(uint)size))
-            throw new InvalidOperationException("FlushInstructionCache failed: " + Win32Error.LastError());
+        var status = DirectSyscalls.NtFlushInstructionCache(hProcess, address, size);
+        if (status != 0)
+            throw new InvalidOperationException($"NtFlushInstructionCache failed: 0x{status:X8}");
     }
 
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
@@ -451,54 +453,9 @@ internal static class NativeMethods
     [return: MarshalAs(UnmanagedType.Bool)]
     internal static extern bool IsWindowVisible(IntPtr hWnd);
 
-    // ---- ntdll ----
-    [DllImport("ntdll.dll")]
-    internal static extern int NtQueryInformationProcess(IntPtr processHandle, int processInformationClass, ref PROCESS_BASIC_INFORMATION processInformation, int processInformationLength, out int returnLength);
-
-    [DllImport("ntdll.dll")]
-    internal static extern int NtQueryInformationThread(IntPtr threadHandle, int threadInformationClass, ref THREAD_BASIC_INFORMATION threadInformation, int threadInformationLength, out int returnLength);
-
-    [DllImport("ntdll.dll", SetLastError = true)]
-    internal static extern int NtAllocateVirtualMemory(IntPtr ProcessHandle, ref IntPtr BaseAddress, IntPtr ZeroBits, ref UIntPtr RegionSize, uint AllocationType, uint Protect);
-
-    [DllImport("ntdll.dll", SetLastError = true)]
-    internal static extern int NtProtectVirtualMemory(IntPtr ProcessHandle, ref IntPtr BaseAddress, ref UIntPtr RegionSize, uint NewProtect, out uint OldProtect);
-
-    [DllImport("ntdll.dll", SetLastError = true)]
-    internal static extern int NtWriteVirtualMemory(IntPtr ProcessHandle, IntPtr BaseAddress, IntPtr Buffer, UIntPtr BufferSize, out UIntPtr NumberOfBytesWritten);
-
-    [DllImport("ntdll.dll", SetLastError = true)]
-    internal static extern int NtReadVirtualMemory(IntPtr ProcessHandle, IntPtr BaseAddress, IntPtr Buffer, UIntPtr BufferSize, out UIntPtr NumberOfBytesRead);
-
-    [DllImport("ntdll.dll", SetLastError = true)]
-    internal static extern int NtCreateThreadEx(out IntPtr ThreadHandle, uint DesiredAccess, IntPtr ObjectAttributes, IntPtr ProcessHandle, IntPtr StartRoutine, IntPtr Argument, uint CreateFlags, IntPtr ZeroBits, IntPtr StackSize, IntPtr MaximumStackSize, IntPtr AttributeList);
-
-    [DllImport("ntdll.dll", SetLastError = true)]
-    internal static extern int NtOpenProcess(out IntPtr ProcessHandle, uint DesiredAccess, IntPtr ObjectAttributes, IntPtr ClientId);
-
-    [DllImport("ntdll.dll", SetLastError = true)]
-    internal static extern int NtCreateSection(out IntPtr SectionHandle, uint DesiredAccess, IntPtr ObjectAttributes, ref long MaximumSize, uint SectionPageProtection, uint AllocationAttributes, IntPtr FileHandle);
-
-    [DllImport("ntdll.dll", SetLastError = true)]
-    internal static extern int NtMapViewOfSection(IntPtr SectionHandle, IntPtr ProcessHandle, ref IntPtr BaseAddress, IntPtr ZeroBits, UIntPtr CommitSize, ref long SectionOffset, out UIntPtr ViewSize, uint InheritDisposition, uint AllocationType, uint Win32Protect);
-
-    [DllImport("ntdll.dll", SetLastError = true)]
-    internal static extern int NtUnmapViewOfSection(IntPtr ProcessHandle, IntPtr BaseAddress);
-
-    [DllImport("ntdll.dll", SetLastError = true)]
-    internal static extern int NtGetContextThread(IntPtr ThreadHandle, IntPtr Context);
-
-    [DllImport("ntdll.dll", SetLastError = true)]
-    internal static extern int NtSetContextThread(IntPtr ThreadHandle, IntPtr Context);
-
-    [DllImport("ntdll.dll", SetLastError = true)]
-    internal static extern int NtSuspendThread(IntPtr ThreadHandle, out uint PreviousSuspendCount);
-
-    [DllImport("ntdll.dll", SetLastError = true)]
-    internal static extern int NtResumeThread(IntPtr ThreadHandle, out uint PreviousSuspendCount);
-
-    [DllImport("ntdll.dll", SetLastError = true)]
-    internal static extern int NtClose(IntPtr Handle);
+    // NOTE: no ntdll imports live here on purpose. All NT syscalls go through
+    // DirectSyscalls (Hell's/Halo's Gate stubs) so usermode hooks on ntdll
+    // exports are bypassed on every memory/thread operation.
 }
 
 [StructLayout(LayoutKind.Sequential)]

@@ -61,9 +61,14 @@ internal sealed unsafe class ModuleStompingInjector : InjectorBase
                 return InjectionResult.Fail(Method, dllPath, "Invalid PE image: " + ex.Message);
             }
 
-            hProcess = NativeMethods.OpenProcess(ProcessAccess, false, pid);
-            if (hProcess == IntPtr.Zero)
-                return InjectionResult.Fail(Method, dllPath, "OpenProcess failed: " + Win32Error.LastError(), NativeMethods.GetLastError());
+            try
+            {
+                hProcess = OpenRemoteProcess(pid, ProcessAccess);
+            }
+            catch (Exception ex)
+            {
+                return InjectionResult.Fail(Method, dllPath, "OpenProcess failed: " + ex.Message);
+            }
 
             var stompTarget = FindStompTarget(hProcess, pe);
             var stompBase = stompTarget.BaseAddress;
@@ -816,7 +821,7 @@ internal sealed unsafe class ModuleStompingInjector : InjectorBase
     private static void SyscallFree(IntPtr hProcess, IntPtr address)
     {
         if (address != IntPtr.Zero)
-            NativeMethods.VirtualFreeEx(hProcess, address, UIntPtr.Zero, NativeConstants.MEM_RELEASE);
+            DirectSyscalls.NtFreeVirtualMemory(hProcess, address);
     }
 
     private static void FreeStubRegions(IntPtr hProcess, ref IntPtr dataRegion, ref IntPtr codeRegion)
@@ -836,8 +841,6 @@ internal sealed unsafe class ModuleStompingInjector : InjectorBase
     /// (unknown TID: raced exit) is treated as exited; every other open or
     /// suspend failure aborts.
     /// </summary>
-    private const uint ErrorInvalidParameter = 87;
-
     private static bool SuspendOtherThreads(uint pid, uint excludeTid, List<IntPtr> suspended, out string? error)
     {
         error = null;
@@ -856,44 +859,59 @@ internal sealed unsafe class ModuleStompingInjector : InjectorBase
         {
             if (tid == excludeTid)
                 continue;
-            var h = NativeMethods.OpenThread(ThreadAccess, false, tid);
-            if (h == IntPtr.Zero)
+            // Direct open has no Win32 last-error worth reading: verify a
+            // failure against a fresh snapshot instead. Gone TID = raced
+            // exit (skip); live TID = denial, abort fail-closed.
+            var openStatus = DirectSyscalls.NtOpenThreadByTid(out var h, ThreadAccess, tid);
+            if (openStatus != 0 || h == IntPtr.Zero)
             {
-                // Verified exit only: unknown TID means it raced away.
-                // Anything else (e.g. access denial on a live thread) aborts.
-                if (NativeMethods.GetLastError() == ErrorInvalidParameter)
+                if (h != IntPtr.Zero)
+                    NativeMethods.CloseHandle(h);
+                if (!ThreadListed(pid, tid))
                     continue;
-                error = $"Could not open target thread {tid} ({Win32Error.LastError()}); refusing to stomp.";
-                if (!ResumeSuspendedOthers(suspended))
-                {
-                    var stuck = suspended.Count;
-                    AbandonSuspendedOthers(suspended);
-                    error += $" In addition, {stuck} already-swept thread(s) could not be verified resumed; inspect the target process.";
-                }
+                error = $"Could not open target thread {tid} (0x{openStatus:X8}); refusing to stomp.";
+                AbortSweep(suspended, ref error);
                 return false;
             }
-            var prev = NativeMethods.SuspendThread(h);
-            if (prev == unchecked((uint)-1))
+            if (DirectSyscalls.NtSuspendThread(h, out _) != 0)
             {
                 // Unverified: the handle was valid a moment ago, so this is
                 // not a proven exit. Abort rather than run exposed.
-                var suspendError = Win32Error.LastError();
                 NativeMethods.CloseHandle(h);
-                error = $"Could not suspend target thread {tid} ({suspendError}); refusing to stomp.";
-                if (!ResumeSuspendedOthers(suspended))
-                {
-                    var stuck = suspended.Count;
-                    AbandonSuspendedOthers(suspended);
-                    error += $" In addition, {stuck} already-swept thread(s) could not be verified resumed; inspect the target process.";
-                }
+                error = $"Could not suspend target thread {tid}; refusing to stomp.";
+                AbortSweep(suspended, ref error);
                 return false;
             }
-            // Keep our +1 even when prev > 0: the extra count stops another
-            // owner from resuming this thread during the overwrite window.
-            // ResumeOthers releases exactly one count, restoring the prior state.
+            // Keep our +1 even when already suspended: the extra count stops
+            // another owner from resuming this thread during the overwrite
+            // window. ResumeOthers releases exactly one count, restoring the
+            // prior state.
             suspended.Add(h);
         }
         return true;
+    }
+
+    private static void AbortSweep(List<IntPtr> suspended, ref string? error)
+    {
+        if (!ResumeSuspendedOthers(suspended))
+        {
+            var stuck = suspended.Count;
+            AbandonSuspendedOthers(suspended);
+            error += $" In addition, {stuck} already-swept thread(s) could not be verified resumed; inspect the target process.";
+        }
+    }
+
+    private static bool ThreadListed(uint pid, uint tid)
+    {
+        try
+        {
+            return ProcessManager.GetThreads(pid).Any(t => t.ThreadId == tid);
+        }
+        catch
+        {
+            // Unverified liveness: assume alive so the sweep aborts.
+            return true;
+        }
     }
 
     private const uint StillActive = 259;
@@ -1048,11 +1066,10 @@ internal sealed unsafe class ModuleStompingInjector : InjectorBase
     {
         hThread = IntPtr.Zero;
         error = null;
-        var handle = NativeMethods.OpenThread(ThreadAccess, false, threadId);
+        var handle = OpenRemoteThread(threadId, ThreadAccess);
         if (handle == IntPtr.Zero)
             return false;
-        var previous = NativeMethods.SuspendThread(handle);
-        if (previous == unchecked((uint)-1))
+        if (DirectSyscalls.NtSuspendThread(handle, out var previous) != 0)
         {
             NativeMethods.CloseHandle(handle);
             return false;

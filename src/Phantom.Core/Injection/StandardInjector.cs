@@ -14,9 +14,14 @@ internal sealed class StandardInjector : InjectorBase
         IntPtr hProcess = IntPtr.Zero;
         try
         {
-            hProcess = NativeMethods.OpenProcess(InjectionAccess, false, pid);
-            if (hProcess == IntPtr.Zero)
-                return InjectionResult.Fail(Method, dllPath, "OpenProcess failed: " + Win32Error.LastError(), NativeMethods.GetLastError());
+            try
+            {
+                hProcess = OpenRemoteProcess(pid, InjectionAccess);
+            }
+            catch (Exception ex)
+            {
+                return InjectionResult.Fail(Method, dllPath, "OpenProcess failed: " + ex.Message);
+            }
 
             // The wrapper records the full 64-bit HMODULE, so success and the
             // returned base are authoritative for the exact path requested.

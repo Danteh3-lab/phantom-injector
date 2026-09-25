@@ -19,19 +19,24 @@ public static class Uninjector
         IntPtr hProcess = IntPtr.Zero;
         try
         {
-            hProcess = NativeMethods.OpenProcess(Access, false, pid);
-            if (hProcess == IntPtr.Zero)
+            var openStatus = DirectSyscalls.NtOpenProcessByPid(out hProcess, Access, pid);
+            if (openStatus != 0 || hProcess == IntPtr.Zero)
+            {
+                hProcess = IntPtr.Zero;
                 return false;
+            }
 
             var freeLibrary = RemoteFunctionResolver.Resolve(pid, "kernel32.dll", "FreeLibrary");
             if (freeLibrary == IntPtr.Zero)
                 return false;
 
-            // CreateRemoteThread's entry takes one parameter; FreeLibrary wants
+            // The remote thread entry takes one parameter; FreeLibrary wants
             // the module base in RCX, which is exactly the first argument.
-            var hThread = NativeMethods.CreateRemoteThread(hProcess, IntPtr.Zero, UIntPtr.Zero,
-                freeLibrary, moduleBase, 0, out _);
-            if (hThread == IntPtr.Zero)
+            // Created via direct syscall (no usermode hooks).
+            var createStatus = DirectSyscalls.NtCreateThreadEx(out var hThread, NativeConstants.THREAD_ALL_ACCESS,
+                IntPtr.Zero, hProcess, freeLibrary, moduleBase, 0,
+                IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+            if (createStatus != 0 || hThread == IntPtr.Zero)
                 return false;
 
             try

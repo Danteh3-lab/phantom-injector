@@ -25,9 +25,13 @@ public static class PostInjectProcessor
         if (moduleBase == IntPtr.Zero)
             return "post-inject skipped: module base unknown.";
 
-        var hProcess = NativeMethods.OpenProcess(Access, false, pid);
-        if (hProcess == IntPtr.Zero)
-            return "post-inject failed: OpenProcess - " + Win32Error.LastError();
+        IntPtr hProcess;
+        {
+            var openStatus = DirectSyscalls.NtOpenProcessByPid(out var opened, Access, pid);
+            if (openStatus != 0 || opened == IntPtr.Zero)
+                return $"post-inject failed: NtOpenProcess - 0x{openStatus:X8}";
+            hProcess = opened;
+        }
 
         try
         {
@@ -62,13 +66,18 @@ public static class PostInjectProcessor
     private static bool EraseHeaders(IntPtr hProcess, IntPtr moduleBase)
     {
         const int size = 0x1000;
-        if (!NativeMethods.VirtualProtectEx(hProcess, moduleBase, (UIntPtr)size,
-                NativeConstants.PAGE_READWRITE, out var oldProtect))
+        var baseAddr = moduleBase;
+        var region = (UIntPtr)size;
+        if (DirectSyscalls.NtProtectVirtualMemory(hProcess, ref baseAddr, ref region,
+                NativeConstants.PAGE_READWRITE, out var oldProtect) != 0)
             return false;
 
-        var ok = NativeMethods.WriteProcessMemory(hProcess, moduleBase, new byte[size], (UIntPtr)size, out _);
+        var ok = DirectSyscalls.NtWriteVirtualMemory(hProcess, moduleBase, new byte[size], out var written) == 0 &&
+                 written.ToUInt64() == (ulong)size;
 
-        NativeMethods.VirtualProtectEx(hProcess, moduleBase, (UIntPtr)size, oldProtect, out _);
+        var restoreBase = moduleBase;
+        var restoreRegion = (UIntPtr)size;
+        DirectSyscalls.NtProtectVirtualMemory(hProcess, ref restoreBase, ref restoreRegion, oldProtect, out _);
         return ok;
     }
 }

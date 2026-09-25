@@ -32,9 +32,14 @@ internal sealed unsafe class ThreadHijackInjector : InjectorBase
         IntPtr hProcess = IntPtr.Zero;
         try
         {
-            hProcess = NativeMethods.OpenProcess(InjectionAccess, false, pid);
-            if (hProcess == IntPtr.Zero)
-                return InjectionResult.Fail(Method, dllPath, "OpenProcess failed: " + Win32Error.LastError(), NativeMethods.GetLastError());
+            try
+            {
+                hProcess = OpenRemoteProcess(pid, InjectionAccess);
+            }
+            catch (Exception ex)
+            {
+                return InjectionResult.Fail(Method, dllPath, "OpenProcess failed: " + ex.Message);
+            }
 
             var candidates = ProcessManager.GetThreads(pid).OrderBy(t => t.ThreadId).ToList();
             if (candidates.Count == 0)
@@ -80,12 +85,11 @@ internal sealed unsafe class ThreadHijackInjector : InjectorBase
         hThread = IntPtr.Zero;
         error = null;
 
-        var handle = NativeMethods.OpenThread(ThreadAccess, false, threadId);
+        var handle = OpenRemoteThread(threadId, ThreadAccess);
         if (handle == IntPtr.Zero)
             return false;
 
-        var previous = NativeMethods.SuspendThread(handle);
-        if (previous == unchecked((uint)-1))
+        if (DirectSyscalls.NtSuspendThread(handle, out var previous) != 0)
         {
             NativeMethods.CloseHandle(handle);
             return false;
@@ -143,7 +147,7 @@ internal sealed unsafe class ThreadHijackInjector : InjectorBase
                 return true;
 
             ctx->Rip = originalRip;
-            if (NativeMethods.SetThreadContext(hThread, ctx))
+            if (DirectSyscalls.NtSetContextThread(hThread, (IntPtr)ctx) == 0)
                 redirected = false;
             return !redirected;
         }
@@ -156,8 +160,8 @@ internal sealed unsafe class ThreadHijackInjector : InjectorBase
                     "Could not create an extended thread context (XState support unavailable).");
 
             ctx = (CONTEXT_X64*)contextPtr;
-            if (!NativeMethods.GetThreadContext(hThread, ctx))
-                return InjectionResult.Fail(Method, dllPath, "GetThreadContext failed: " + Win32Error.LastError());
+            if (DirectSyscalls.NtGetContextThread(hThread, (IntPtr)ctx) != 0)
+                return InjectionResult.Fail(Method, dllPath, "NtGetContextThread failed.");
 
             originalRip = ctx->Rip;
             var originalRsp = ctx->Rsp;
@@ -198,10 +202,10 @@ internal sealed unsafe class ThreadHijackInjector : InjectorBase
             NativeMethods.FlushInstructionCacheChecked(hProcess, stubAddress, stub.Length);
 
             ctx->Rip = (ulong)stubAddress.ToInt64();
-            if (!NativeMethods.SetThreadContext(hThread, ctx))
+            if (DirectSyscalls.NtSetContextThread(hThread, (IntPtr)ctx) != 0)
             {
                 Release();
-                return InjectionResult.Fail(Method, dllPath, "SetThreadContext failed: " + Win32Error.LastError());
+                return InjectionResult.Fail(Method, dllPath, "NtSetContextThread failed.");
             }
 
             redirected = true;
@@ -224,7 +228,7 @@ internal sealed unsafe class ThreadHijackInjector : InjectorBase
                     "The hijacked thread did not finish loading; its stub was left intact and the thread may still be running.");
 
             // The stub is now parked: suspend, restore the original state, resume.
-            if (NativeMethods.SuspendThread(hThread) == unchecked((uint)-1))
+            if (DirectSyscalls.NtSuspendThread(hThread, out _) != 0)
                 return InjectionResult.Fail(Method, dllPath,
                     "Could not re-suspend the hijacked thread to restore its state; it was left parked in the stub.");
 
@@ -233,7 +237,8 @@ internal sealed unsafe class ThreadHijackInjector : InjectorBase
             var lastErrorRestored = WriteUInt32(hProcess, IntPtr.Add(teb, TebLastErrorOffset), lastError);
 
             ctx->Rip = originalRip;
-            if (!NativeMethods.SetThreadContext(hThread, ctx) && !NativeMethods.SetThreadContext(hThread, ctx))
+            if (DirectSyscalls.NtSetContextThread(hThread, (IntPtr)ctx) != 0 &&
+                DirectSyscalls.NtSetContextThread(hThread, (IntPtr)ctx) != 0)
             {
                 if (!UndoRedirect())
                     return InjectionResult.Fail(Method, dllPath,
@@ -332,21 +337,20 @@ internal sealed unsafe class ThreadHijackInjector : InjectorBase
         stackLimit = 0;
         lastError = 0;
 
-        var info = new THREAD_BASIC_INFORMATION();
-        var status = NativeMethods.NtQueryInformationThread(hThread, 0, ref info,
-            Marshal.SizeOf<THREAD_BASIC_INFORMATION>(), out _);
-        if (status != 0 || info.TebBaseAddress == IntPtr.Zero)
+        if (DirectSyscalls.NtQueryTeb(hThread, out var tebBase) != 0 || tebBase == IntPtr.Zero)
             return false;
 
-        teb = info.TebBaseAddress;
+        teb = tebBase;
 
         var limit = new byte[8];
-        if (!NativeMethods.ReadProcessMemory(hProcess, IntPtr.Add(teb, TebStackLimitOffset), limit, (UIntPtr)8, out _))
+        if (DirectSyscalls.NtReadVirtualMemory(hProcess, IntPtr.Add(teb, TebStackLimitOffset), limit, out var lr) != 0 ||
+            lr.ToUInt64() != 8)
             return false;
         stackLimit = BitConverter.ToUInt64(limit, 0);
 
         var error = new byte[4];
-        if (!NativeMethods.ReadProcessMemory(hProcess, IntPtr.Add(teb, TebLastErrorOffset), error, (UIntPtr)4, out _))
+        if (DirectSyscalls.NtReadVirtualMemory(hProcess, IntPtr.Add(teb, TebLastErrorOffset), error, out var er) != 0 ||
+            er.ToUInt64() != 4)
             return false;
         lastError = BitConverter.ToUInt32(error, 0);
 
@@ -355,10 +359,10 @@ internal sealed unsafe class ThreadHijackInjector : InjectorBase
 
     private static bool ResumeChecked(IntPtr hThread)
     {
-        if (NativeMethods.ResumeThread(hThread) != unchecked((uint)-1))
+        if (DirectSyscalls.NtResumeThread(hThread, out _) == 0)
             return true;
 
-        return NativeMethods.ResumeThread(hThread) != unchecked((uint)-1);
+        return DirectSyscalls.NtResumeThread(hThread, out _) == 0;
     }
 
     private static int Align(int value, int alignment)
@@ -374,11 +378,11 @@ internal sealed unsafe class ThreadHijackInjector : InjectorBase
 
         while (Environment.TickCount64 < deadline)
         {
-            if (NativeMethods.ReadProcessMemory(hProcess, doneSlot, buffer, (UIntPtr)8, out var doneRead) &&
+            if (DirectSyscalls.NtReadVirtualMemory(hProcess, doneSlot, buffer, out var doneRead) == 0 &&
                 doneRead.ToUInt64() == 8 &&
                 BitConverter.ToInt64(buffer, 0) != 0)
             {
-                if (NativeMethods.ReadProcessMemory(hProcess, resultSlot, buffer, (UIntPtr)8, out var resultRead) &&
+                if (DirectSyscalls.NtReadVirtualMemory(hProcess, resultSlot, buffer, out var resultRead) == 0 &&
                     resultRead.ToUInt64() == 8)
                 {
                     result = BitConverter.ToInt64(buffer, 0);
@@ -395,7 +399,7 @@ internal sealed unsafe class ThreadHijackInjector : InjectorBase
     }
 
     private static bool WriteUInt32(IntPtr hProcess, IntPtr address, uint value)
-        => NativeMethods.WriteProcessMemory(hProcess, address, BitConverter.GetBytes(value), (UIntPtr)4, out _);
+        => DirectSyscalls.NtWriteVirtualMemory(hProcess, address, BitConverter.GetBytes(value), out _) == 0;
 
     /// <summary>
     /// Builds the load stub. Because the full context is restored afterwards by

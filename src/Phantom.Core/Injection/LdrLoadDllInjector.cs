@@ -23,9 +23,14 @@ internal sealed class LdrLoadDllInjector : InjectorBase
         var remoteThread = default(RemoteThreadResult);
         try
         {
-            hProcess = NativeMethods.OpenProcess(InjectionAccess, false, pid);
-            if (hProcess == IntPtr.Zero)
-                return InjectionResult.Fail(Method, dllPath, "OpenProcess failed: " + Win32Error.LastError(), NativeMethods.GetLastError());
+            try
+            {
+                hProcess = OpenRemoteProcess(pid, InjectionAccess);
+            }
+            catch (Exception ex)
+            {
+                return InjectionResult.Fail(Method, dllPath, "OpenProcess failed: " + ex.Message);
+            }
 
             var ldrLoadDll = ResolveRemoteExport(pid, "ntdll.dll", "LdrLoadDll");
 
@@ -54,7 +59,7 @@ internal sealed class LdrLoadDllInjector : InjectorBase
                     "Injection did not complete (timeout or wait failure); the remote thread may still be running so its buffers were left intact.");
 
             if (!remoteThread.Created)
-                return InjectionResult.Fail(Method, dllPath, "CreateRemoteThread failed: " + Win32Error.LastError(), NativeMethods.GetLastError());
+                return InjectionResult.Fail(Method, dllPath, "NtCreateThreadEx failed in the target.");
 
             // NTSTATUS_SUCCESS == 0
             if (remoteThread.ExitCode != 0)
@@ -63,12 +68,10 @@ internal sealed class LdrLoadDllInjector : InjectorBase
                     $"LdrLoadDll returned NTSTATUS 0x{remoteThread.ExitCode:X8}. The target may restrict this call.", remoteThread.ExitCode);
             }
 
-            var handleBytes = new byte[8];
-            if (!NativeMethods.ReadProcessMemory(hProcess, remoteHandle, handleBytes, (UIntPtr)8, out var read) ||
-                read.ToUInt64() != 8)
+            if (!TryReadRemoteInt64(hProcess, remoteHandle, out var handleValue))
                 return InjectionResult.Fail(Method, dllPath, "LdrLoadDll returned success but the module handle could not be read back.");
 
-            var moduleBase = new IntPtr(BitConverter.ToInt64(handleBytes, 0));
+            var moduleBase = new IntPtr(handleValue);
             if (moduleBase == IntPtr.Zero)
                 return InjectionResult.Fail(Method, dllPath, "LdrLoadDll returned success but reported a null module handle.");
 

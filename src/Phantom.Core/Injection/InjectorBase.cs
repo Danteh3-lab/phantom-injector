@@ -21,21 +21,46 @@ internal abstract class InjectorBase : IInjector
         NativeConstants.PROCESS_VM_WRITE |
         NativeConstants.PROCESS_VM_READ;
 
+    /// <summary>
+    /// Opens a target process handle via direct syscall (no usermode hooks).
+    /// </summary>
+    protected static IntPtr OpenRemoteProcess(uint pid, uint access)
+    {
+        var status = DirectSyscalls.NtOpenProcessByPid(out var hProcess, access, pid);
+        if (status != 0 || hProcess == IntPtr.Zero)
+            throw new InvalidOperationException($"NtOpenProcess failed: 0x{status:X8}");
+        return hProcess;
+    }
+
+    /// <summary>
+    /// Opens a target thread handle via direct syscall. Returns Zero on
+    /// failure (mirrors OpenThread semantics); callers check for Zero.
+    /// </summary>
+    protected static IntPtr OpenRemoteThread(uint tid, uint access)
+    {
+        var status = DirectSyscalls.NtOpenThreadByTid(out var hThread, access, tid);
+        if (status != 0 || hThread == IntPtr.Zero)
+            return IntPtr.Zero;
+        return hThread;
+    }
+
     protected static IntPtr AllocateRemote(IntPtr hProcess, int size, uint protect = NativeConstants.PAGE_READWRITE)
     {
-        var addr = NativeMethods.VirtualAllocEx(hProcess, IntPtr.Zero, (UIntPtr)(uint)size,
-            NativeConstants.MEM_COMMIT | NativeConstants.MEM_RESERVE, protect);
-        if (addr == IntPtr.Zero)
-            throw new InvalidOperationException("VirtualAllocEx failed: " + Win32Error.LastError());
-        return addr;
+        var baseAddr = IntPtr.Zero;
+        var region = (UIntPtr)(uint)size;
+        var status = DirectSyscalls.NtAllocateVirtualMemory(hProcess, ref baseAddr, IntPtr.Zero,
+            ref region, NativeConstants.MEM_COMMIT | NativeConstants.MEM_RESERVE, protect);
+        if (status != 0 || baseAddr == IntPtr.Zero)
+            throw new InvalidOperationException($"NtAllocateVirtualMemory failed: 0x{status:X8}");
+        return baseAddr;
     }
 
     protected static void WriteRemote(IntPtr hProcess, IntPtr address, byte[] data)
     {
-        if (!NativeMethods.WriteProcessMemory(hProcess, address, data, (UIntPtr)(uint)data.Length, out var written))
-            throw new InvalidOperationException("WriteProcessMemory failed: " + Win32Error.LastError());
+        if (DirectSyscalls.NtWriteVirtualMemory(hProcess, address, data, out var written) != 0)
+            throw new InvalidOperationException("NtWriteVirtualMemory failed.");
         if (written.ToUInt64() != (ulong)data.Length)
-            throw new InvalidOperationException("WriteProcessMemory wrote a partial buffer.");
+            throw new InvalidOperationException("NtWriteVirtualMemory wrote a partial buffer.");
     }
 
     /// <summary>
@@ -76,13 +101,13 @@ internal abstract class InjectorBase : IInjector
     protected static void FreeRemote(IntPtr hProcess, IntPtr address)
     {
         if (address != IntPtr.Zero)
-            NativeMethods.VirtualFreeEx(hProcess, address, UIntPtr.Zero, NativeConstants.MEM_RELEASE);
+            DirectSyscalls.NtFreeVirtualMemory(hProcess, address);
     }
 
     protected static bool TryReadRemoteInt64(IntPtr hProcess, IntPtr address, out long value)
     {
         var buffer = new byte[8];
-        if (!NativeMethods.ReadProcessMemory(hProcess, address, buffer, (UIntPtr)8, out var read) ||
+        if (DirectSyscalls.NtReadVirtualMemory(hProcess, address, buffer, out var read) != 0 ||
             read.ToUInt64() != 8)
         {
             value = 0;
@@ -172,15 +197,32 @@ internal abstract class InjectorBase : IInjector
     }
 
     /// <summary>
-    /// Runs a remote thread at <paramref name="start"/> and waits for completion.
+    /// Runs a remote thread at <paramref name="start"/> (created via direct
+    /// NtCreateThreadEx syscall) and waits for completion.
     /// On timeout the thread handle is closed but the thread keeps running, so
     /// the caller must not free any memory that thread can still reach.
     /// </summary>
     protected static RemoteThreadResult RunRemoteThread(IntPtr hProcess, IntPtr start, IntPtr parameter, int timeoutMs)
     {
-        var hThread = NativeMethods.CreateRemoteThread(hProcess, IntPtr.Zero, UIntPtr.Zero, start, parameter, 0, out var threadId);
-        if (hThread == IntPtr.Zero)
+        var status = DirectSyscalls.NtCreateThreadEx(out var hThread, NativeConstants.THREAD_ALL_ACCESS,
+            IntPtr.Zero, hProcess, start, parameter, 0,
+            IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+        if (status != 0 || hThread == IntPtr.Zero)
             return new RemoteThreadResult { Created = false };
+
+        // NtCreateThreadEx reports no TID: query it via syscall instead of
+        // falling back to a hooked Win32 lookup. Strictly informational, so a
+        // throwing query (stub resolution, marshalling) must never escape and
+        // let callers free the stub while this thread is running it.
+        uint threadId = 0;
+        try
+        {
+            DirectSyscalls.NtQueryThreadId(hThread, out threadId);
+        }
+        catch
+        {
+            threadId = 0;
+        }
 
         try
         {

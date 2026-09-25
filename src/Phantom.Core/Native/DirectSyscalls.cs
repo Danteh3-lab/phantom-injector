@@ -48,6 +48,15 @@ internal static class DirectSyscalls
     private delegate int NtOpenProcessDelegate(out IntPtr ProcessHandle, uint DesiredAccess, IntPtr ObjectAttributes, IntPtr ClientId);
 
     [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    private delegate int NtOpenThreadDelegate(out IntPtr ThreadHandle, uint DesiredAccess, IntPtr ObjectAttributes, IntPtr ClientId);
+
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    private delegate int NtFreeVirtualMemoryDelegate(IntPtr ProcessHandle, ref IntPtr BaseAddress, ref UIntPtr RegionSize, uint FreeType);
+
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    private delegate int NtFlushInstructionCacheDelegate(IntPtr ProcessHandle, IntPtr BaseAddress, UIntPtr Length);
+
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
     private delegate int NtCreateSectionDelegate(out IntPtr SectionHandle, uint DesiredAccess, IntPtr ObjectAttributes, IntPtr MaximumSize, uint SectionPageProtection, uint AllocationAttributes, IntPtr FileHandle);
 
     [UnmanagedFunctionPointer(CallingConvention.StdCall)]
@@ -73,6 +82,9 @@ internal static class DirectSyscalls
 
     [UnmanagedFunctionPointer(CallingConvention.StdCall)]
     private delegate int NtQueryInformationThreadDelegate(IntPtr ThreadHandle, int ThreadInformationClass, IntPtr ThreadInformation, int ThreadInformationLength, out int ReturnLength);
+
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    private delegate int NtQueryInformationProcessDelegate(IntPtr ProcessHandle, int ProcessInformationClass, IntPtr ProcessInformation, int ProcessInformationLength, out int ReturnLength);
 
     [StructLayout(LayoutKind.Sequential)]
     private struct NativeClientId
@@ -407,11 +419,17 @@ internal static class DirectSyscalls
 
         Marshal.Copy(stub, 0, ptr, stub.Length);
 
-        if (!NativeMethods.VirtualProtectEx(System.Diagnostics.Process.GetCurrentProcess().Handle,
-                ptr, (UIntPtr)stub.Length, NativeConstants.PAGE_EXECUTE_READ, out _))
+        // Bootstrap exception: no syscall stub exists yet at this point, so
+        // self-protection must NOT go through the Nt* wrappers (each wrapper
+        // calls GetSyscallStub, which re-enters this method = unbounded
+        // recursion). Raw Win32 on our own process memory is used instead;
+        // this is local stub setup, never a target operation.
+        var selfHandle = System.Diagnostics.Process.GetCurrentProcess().Handle;
+        if (!NativeMethods.VirtualProtectEx(selfHandle, ptr, (UIntPtr)stub.Length, NativeConstants.PAGE_EXECUTE_READ, out _))
             throw new InvalidOperationException("Failed to protect syscall stub");
 
-        NativeMethods.FlushInstructionCacheChecked(System.Diagnostics.Process.GetCurrentProcess().Handle, ptr, stub.Length);
+        if (!NativeMethods.FlushInstructionCache(selfHandle, ptr, (UIntPtr)stub.Length))
+            throw new InvalidOperationException("Failed to flush syscall stub");
         return ptr;
     }
 
@@ -429,13 +447,18 @@ internal static class DirectSyscalls
         return del(processHandle, ref baseAddress, ref regionSize, newProtect, out oldProtect);
     }
 
-    public static unsafe int NtWriteVirtualMemory(IntPtr processHandle, IntPtr baseAddress, byte[] buffer, out UIntPtr bytesWritten)
+    public static int NtWriteVirtualMemory(IntPtr processHandle, IntPtr baseAddress, byte[] buffer, out UIntPtr bytesWritten)
     {
         var stub = GetSyscallStub("NtWriteVirtualMemory");
         var del = Marshal.GetDelegateForFunctionPointer<NtWriteVirtualMemoryDelegate>(stub);
-        fixed (byte* p = buffer)
+        var handle = GCHandle.Alloc(buffer, GCHandleType.Pinned);
+        try
         {
-            return del(processHandle, baseAddress, (IntPtr)p, (UIntPtr)(uint)buffer.Length, out bytesWritten);
+            return del(processHandle, baseAddress, handle.AddrOfPinnedObject(), (UIntPtr)(uint)buffer.Length, out bytesWritten);
+        }
+        finally
+        {
+            handle.Free();
         }
     }
 
@@ -461,12 +484,52 @@ internal static class DirectSyscalls
         return del(out threadHandle, desiredAccess, objectAttributes, processHandle, startRoutine, argument, createFlags, zeroBits, stackSize, maximumStackSize, attributeList);
     }
 
-    public static unsafe int NtOpenProcessByPid(out IntPtr processHandle, uint desiredAccess, uint pid)
+    public static int NtOpenProcessByPid(out IntPtr processHandle, uint desiredAccess, uint pid)
     {
         var stub = GetSyscallStub("NtOpenProcess");
         var del = Marshal.GetDelegateForFunctionPointer<NtOpenProcessDelegate>(stub);
-        var cid = new NativeClientId { UniqueProcess = new IntPtr(pid), UniqueThread = IntPtr.Zero };
-        return del(out processHandle, desiredAccess, IntPtr.Zero, (IntPtr)(&cid));
+        var cidPtr = Marshal.AllocHGlobal(Marshal.SizeOf<NativeClientId>());
+        try
+        {
+            Marshal.StructureToPtr(new NativeClientId { UniqueProcess = new IntPtr(pid), UniqueThread = IntPtr.Zero }, cidPtr, false);
+            return del(out processHandle, desiredAccess, IntPtr.Zero, cidPtr);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(cidPtr);
+        }
+    }
+
+    public static int NtOpenThreadByTid(out IntPtr threadHandle, uint desiredAccess, uint tid)
+    {
+        var stub = GetSyscallStub("NtOpenThread");
+        var del = Marshal.GetDelegateForFunctionPointer<NtOpenThreadDelegate>(stub);
+        var cidPtr = Marshal.AllocHGlobal(Marshal.SizeOf<NativeClientId>());
+        try
+        {
+            Marshal.StructureToPtr(new NativeClientId { UniqueProcess = IntPtr.Zero, UniqueThread = new IntPtr(tid) }, cidPtr, false);
+            return del(out threadHandle, desiredAccess, IntPtr.Zero, cidPtr);
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(cidPtr);
+        }
+    }
+
+    public static int NtFreeVirtualMemory(IntPtr processHandle, IntPtr baseAddress)
+    {
+        var stub = GetSyscallStub("NtFreeVirtualMemory");
+        var del = Marshal.GetDelegateForFunctionPointer<NtFreeVirtualMemoryDelegate>(stub);
+        var baseAddr = baseAddress;
+        var regionSize = UIntPtr.Zero;
+        return del(processHandle, ref baseAddr, ref regionSize, NativeConstants.MEM_RELEASE);
+    }
+
+    public static int NtFlushInstructionCache(IntPtr processHandle, IntPtr baseAddress, int size)
+    {
+        var stub = GetSyscallStub("NtFlushInstructionCache");
+        var del = Marshal.GetDelegateForFunctionPointer<NtFlushInstructionCacheDelegate>(stub);
+        return del(processHandle, baseAddress, (UIntPtr)(uint)size);
     }
 
     public static int NtCreateSection(out IntPtr sectionHandle, uint desiredAccess, IntPtr objectAttributes, IntPtr maximumSize, uint sectionPageProtection, uint allocationAttributes, IntPtr fileHandle)
@@ -530,6 +593,58 @@ internal static class DirectSyscalls
         var stub = GetSyscallStub("NtQueryInformationThread");
         var del = Marshal.GetDelegateForFunctionPointer<NtQueryInformationThreadDelegate>(stub);
         return del(threadHandle, threadInformationClass, threadInformation, threadInformationLength, out returnLength);
+    }
+
+    /// <summary>
+    /// Queries ThreadBasicInformation (class 0) and returns the OS thread ID.
+    /// </summary>
+    public static int NtQueryThreadId(IntPtr threadHandle, out uint threadId)
+    {
+        threadId = 0;
+        var size = Marshal.SizeOf<THREAD_BASIC_INFORMATION>();
+        var buf = Marshal.AllocHGlobal(size);
+        try
+        {
+            var status = NtQueryInformationThread(threadHandle, 0, buf, size, out _);
+            if (status != 0)
+                return status;
+            var info = Marshal.PtrToStructure<THREAD_BASIC_INFORMATION>(buf);
+            threadId = (uint)info.UniqueThread.ToInt64();
+            return 0;
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buf);
+        }
+    }
+
+    public static int NtQueryInformationProcess(IntPtr processHandle, int processInformationClass, IntPtr processInformation, int processInformationLength, out int returnLength)
+    {
+        var stub = GetSyscallStub("NtQueryInformationProcess");
+        var del = Marshal.GetDelegateForFunctionPointer<NtQueryInformationProcessDelegate>(stub);
+        return del(processHandle, processInformationClass, processInformation, processInformationLength, out returnLength);
+    }
+
+    /// <summary>
+    /// Queries ProcessBasicInformation (class 0) and returns the PEB base.
+    /// </summary>
+    public static int NtQueryPeb(IntPtr processHandle, out IntPtr pebBase)
+    {
+        pebBase = IntPtr.Zero;
+        var size = Marshal.SizeOf<PROCESS_BASIC_INFORMATION>();
+        var buf = Marshal.AllocHGlobal(size);
+        try
+        {
+            var status = NtQueryInformationProcess(processHandle, 0, buf, size, out _);
+            if (status != 0)
+                return status;
+            pebBase = Marshal.PtrToStructure<PROCESS_BASIC_INFORMATION>(buf).PebBaseAddress;
+            return 0;
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buf);
+        }
     }
 
     /// <summary>
