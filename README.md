@@ -12,12 +12,21 @@ is a clean-room re-implementation of the feature set described in its README.
 ## Features
 
 - **Injection methods**
-  - `Standard` – `CreateRemoteThread` + `LoadLibraryW` (most compatible)
+  - `Standard` – remote thread + `LoadLibraryW` (most compatible)
   - `LdrLoadDll` – direct `ntdll!LdrLoadDll` call one level below `LoadLibrary`
-  - `ThreadHijack` – suspends an existing thread, redirects its RIP, no `CreateRemoteThread`
+  - `ThreadHijack` – suspends an existing thread, redirects its RIP, no remote thread
   - `ManualMap` – reflective mapping: imports, relocations and TLS resolved by the injector;
     the module never enters the loader lists
+  - `DllHollowing` – maps a signed system DLL as a file-backed image section
+    (`MEM_IMAGE`), reflectively maps the payload into it, runs it via thread hijack
+  - `ModuleStomping` – overwrites a non-critical loaded module with the payload
+    image (no new private executable memory), runs it via thread hijack
   - `LdrpLoadDll` – intentionally disabled (undocumented, broken after Windows 10 1709)
+- **Direct syscalls** – all memory/thread operations (`NtAllocateVirtualMemory`,
+  `NtProtectVirtualMemory`, `NtWriteVirtualMemory`, `NtReadVirtualMemory`,
+  `NtCreateThreadEx`, `NtOpenProcess`, `NtCreateSection`, `NtMapViewOfSection`,
+  contexts, suspend/resume, flush) bypass usermode hooks via Hell's/Halo's Gate
+  stubs resolved from a clean on-disk `ntdll.dll`
 - **Multi-DLL** queue with per-DLL enable/disable, drag & drop
 - **Auto-inject** when the target process starts
 - **Close on inject**
@@ -61,6 +70,40 @@ dotnet publish src/Phantom.UI/Phantom.UI.csproj -c Release -r win-x64 --self-con
 4. Pick a method and options, then click **Inject**.
 
 For manual map + `Erase PE` + `Hide Module`, use an unsigned test DLL first.
+
+## Injection methods – how to use each
+
+- `Standard` – default choice. Works with almost any DLL, including ones with
+  static TLS. Use when compatibility matters more than stealth.
+- `LdrLoadDll` – same payload requirements as `Standard`, one loader level
+  deeper. Use to dodge naive `LoadLibraryW` hooks.
+- `ThreadHijack` – no remote thread is created; needs a target thread with
+  enough free stack (checked against the TEB). Use when thread-creation telemetry
+  is the concern. Same payload requirements as `Standard`.
+- `ManualMap` – use for loader-invisible mappings. The DLL must be relocatable
+  (or match its preferred base), have resolvable imports, and must **not** use
+  static TLS data (rejected up front – use a loader-based method instead).
+  Combine with `Erase PE` + `Hide Module` for minimal footprint.
+- `DllHollowing` – use when private executable allocations are the detection
+  surface: the payload lives in a file-backed `MEM_IMAGE` view. Requirements:
+  a suitable signed system DLL must already be loaded in the target **and** its
+  image must be at least as large as the payload (`SizeOfImage`); same
+  relocation/import/TLS rules as `ManualMap`. `DllMain` runs as
+  `(hModule, DLL_PROCESS_ATTACH, NULL)` under the loader lock on the hijacked
+  thread, and the reported base is the mapped view.
+- `ModuleStomping` – use when even a new image section stands out: an existing
+  non-critical module is overwritten in place, so no new allocation appears at
+  all. Requirements: a loaded non-critical module with `SizeOfImage` and `.text`
+  capacity ≥ payload; same relocation/import/TLS rules as `ManualMap`. All other
+  target threads are suspended during the overwrite window. The host module is
+  byte-backed-up first: clean failures restore it, but a failed restore leaves
+  the target in a retain state (see below).
+- `Erase PE` / `Hide Module` work on every method's reported base, including
+  hollowed views and stomped modules.
+- **Retain states:** if the log reports a stub/view left mapped, a thread left
+  suspended (e.g. loader-lock release failure), or a failed host restore,
+  **restart the target process** – resuming or freeing in those states would
+  corrupt or deadlock it. These outcomes are fail-closed by design.
 
 ## Safety / known limitations
 
@@ -110,6 +153,24 @@ For manual map + `Erase PE` + `Hide Module`, use an unsigned test DLL first.
   under the real loader lock (a stub calling `LdrLockLoaderLock`). The outcome
   status is published only after `LdrUnlockLoaderLock` succeeds, so a mapping
   is never reported as hidden while the lock could not be released.
+- **DLL hollowing** maps the carrier with `NtCreateSection(SEC_IMAGE)` from a
+  real signed file handle (never a handle-less section), verifies the view fits
+  the payload, then applies the same relocation/import/TLS/exception validation
+  as manual map before `DllMain` runs. Carrier bytes are backed up first; clean
+  failures restore them while the hijacked thread is still suspended, and only
+  verified restores resume anything.
+- **Module stomping** suspends every other target thread across the
+  backup/overwrite/init window (fail-closed sweep: any unverified open/suspend
+  aborts untouched) and restores the host from backup on clean failures – but
+  only while no thread can execute it. Rollback is two-mode: protection-only
+  failures re-apply saved page protections without rewriting bytes; byte
+  rollbacks rewrite the backup and restore the full saved page map (captured via
+  `VirtualQueryEx`, so gaps the section list misses are covered). A failed
+  restore retains everything suspended – restart the target.
+- **Hijack init stubs** (hollowing/stomping) align the stack once at entry, use
+  correct shadow space on every call including the `Sleep(1)` park loop, always
+  signal completion (including loader-lock failure), and never restore/resume a
+  thread that may still own the loader lock.
 - **Secure mode** copies the whole application output directory to `%TEMP%` and
   works for both single-file publishes and normal builds.
 
@@ -130,9 +191,10 @@ intentionally silent to avoid running UI under the loader lock.
 
 ```
 src/Phantom.Core/        Injector engine (no UI)
-  Native/                P/Invoke, CONTEXT, structs, error helpers
+  Native/                Direct syscalls (Hell's/Halo's Gate), P/Invoke, CONTEXT, structs, error helpers
   Processes/             Process/module/thread/window enumeration, privileges
-  Injection/             Standard, LdrLoadDll, ThreadHijack, ManualMap, PE parser
+  Injection/             Standard, LdrLoadDll, ThreadHijack, ManualMap,
+                         DllHollowing, ModuleStomping, ReflectiveMapper, PE parser
   PostInject/            Loader-lock module hiding, uninjector, export caller
   Stealth/               Scrambler, secure mode, auto-inject watcher, dependency check
 src/Phantom.UI/          WinForms front-end
