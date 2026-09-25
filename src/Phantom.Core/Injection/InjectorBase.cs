@@ -45,15 +45,7 @@ internal abstract class InjectorBase : IInjector
     }
 
     protected static IntPtr AllocateRemote(IntPtr hProcess, int size, uint protect = NativeConstants.PAGE_READWRITE)
-    {
-        var baseAddr = IntPtr.Zero;
-        var region = (UIntPtr)(uint)size;
-        var status = DirectSyscalls.NtAllocateVirtualMemory(hProcess, ref baseAddr, IntPtr.Zero,
-            ref region, NativeConstants.MEM_COMMIT | NativeConstants.MEM_RESERVE, protect);
-        if (status != 0 || baseAddr == IntPtr.Zero)
-            throw new InvalidOperationException($"NtAllocateVirtualMemory failed: 0x{status:X8}");
-        return baseAddr;
-    }
+        => SectionMemory.Allocate(hProcess, size, protect);
 
     protected static void WriteRemote(IntPtr hProcess, IntPtr address, byte[] data)
     {
@@ -99,10 +91,7 @@ internal abstract class InjectorBase : IInjector
     }
 
     protected static void FreeRemote(IntPtr hProcess, IntPtr address)
-    {
-        if (address != IntPtr.Zero)
-            DirectSyscalls.NtFreeVirtualMemory(hProcess, address);
-    }
+        => SectionMemory.Free(hProcess, address);
 
     protected static bool TryReadRemoteInt64(IntPtr hProcess, IntPtr address, out long value)
     {

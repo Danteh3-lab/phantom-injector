@@ -127,6 +127,8 @@ internal sealed unsafe class ThreadHijackInjector : InjectorBase
         var threadRunning = false;
         CONTEXT_X64* ctx = null;
         var originalRip = 0UL;
+        var originalRspValue = 0UL;
+        var originalRbpValue = 0UL;
         var redirected = false;
 
         // Releases our suspension if we still hold one.
@@ -140,13 +142,18 @@ internal sealed unsafe class ThreadHijackInjector : InjectorBase
         }
 
         // Only valid while the thread is suspended: puts the original context
-        // back so a later resume cannot start an abandoned stub.
+        // back so a later resume cannot start an abandoned stub. Restores
+        // RIP and RSP/RBP together: the stub may run on a spoofed stack, and
+        // resuming original RIP on the fake stack would crash the thread just
+        // before its region is freed.
         bool UndoRedirect()
         {
             if (!redirected || ctx == null)
                 return true;
 
             ctx->Rip = originalRip;
+            ctx->Rsp = originalRspValue;
+            ctx->Rbp = originalRbpValue;
             if (DirectSyscalls.NtSetContextThread(hThread, (IntPtr)ctx) == 0)
                 redirected = false;
             return !redirected;
@@ -164,7 +171,9 @@ internal sealed unsafe class ThreadHijackInjector : InjectorBase
                 return InjectionResult.Fail(Method, dllPath, "NtGetContextThread failed.");
 
             originalRip = ctx->Rip;
-            var originalRsp = ctx->Rsp;
+            originalRspValue = ctx->Rsp;
+            originalRbpValue = ctx->Rbp;
+            var originalRsp = originalRspValue;
 
             if (!TryGetTebInfo(hProcess, hThread, out var teb, out var stackLimit, out var lastError))
             {
@@ -201,6 +210,12 @@ internal sealed unsafe class ThreadHijackInjector : InjectorBase
             WriteRemote(hProcess, stubAddress, stub);
             NativeMethods.FlushInstructionCacheChecked(hProcess, stubAddress, stub.Length);
 
+            // NOTE: no spoofed stack. A fake stack placed adjacent to the stub
+            // would grow downward into the stub/data slots on deep
+            // LoadLibraryW/DllMain call chains (no guard page, unrestorable
+            // corruption). LoadLibraryW runs on the interrupted thread's own
+            // stack. See StackSpoof.cs for the guarded-stack design needed to
+            // revive this safely.
             ctx->Rip = (ulong)stubAddress.ToInt64();
             if (DirectSyscalls.NtSetContextThread(hThread, (IntPtr)ctx) != 0)
             {
@@ -237,6 +252,8 @@ internal sealed unsafe class ThreadHijackInjector : InjectorBase
             var lastErrorRestored = WriteUInt32(hProcess, IntPtr.Add(teb, TebLastErrorOffset), lastError);
 
             ctx->Rip = originalRip;
+            ctx->Rsp = originalRspValue;
+            ctx->Rbp = originalRbpValue;
             if (DirectSyscalls.NtSetContextThread(hThread, (IntPtr)ctx) != 0 &&
                 DirectSyscalls.NtSetContextThread(hThread, (IntPtr)ctx) != 0)
             {

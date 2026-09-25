@@ -27,6 +27,9 @@ is a clean-room re-implementation of the feature set described in its README.
   `NtCreateThreadEx`, `NtOpenProcess`, `NtCreateSection`, `NtMapViewOfSection`,
   contexts, suspend/resume, flush) bypass usermode hooks via Hell's/Halo's Gate
   stubs resolved from a clean on-disk `ntdll.dll`
+- **Section-backed scratch memory** – all temporary remote buffers (stubs,
+  slots, images) are pagefile section mappings, never private `VirtualAlloc`
+  memory
 - **Multi-DLL** queue with per-DLL enable/disable, drag & drop
 - **Auto-inject** when the target process starts
 - **Close on inject**
@@ -79,7 +82,9 @@ For manual map + `Erase PE` + `Hide Module`, use an unsigned test DLL first.
   deeper. Use to dodge naive `LoadLibraryW` hooks.
 - `ThreadHijack` – no remote thread is created; needs a target thread with
   enough free stack (checked against the TEB). Use when thread-creation telemetry
-  is the concern. Same payload requirements as `Standard`.
+  is the concern. Same payload requirements as `Standard`. The stub runs on the
+  interrupted thread's own stack; call-stack spoofing is designed but dormant
+  (it needs a separate guarded execution stack before it is safe to enable).
 - `ManualMap` – use for loader-invisible mappings. The DLL must be relocatable
   (or match its preferred base), have resolvable imports, and must **not** use
   static TLS data (rejected up front – use a loader-based method instead).
@@ -152,7 +157,11 @@ For manual map + `Erase PE` + `Hide Module`, use an unsigned test DLL first.
 - **Hide module** locates the loader entry *and* unlinks it inside the target
   under the real loader lock (a stub calling `LdrLockLoaderLock`). The outcome
   status is published only after `LdrUnlockLoaderLock` succeeds, so a mapping
-  is never reported as hidden while the lock could not be released.
+  is never reported as hidden while the lock could not be released. The stub
+  additionally removes the entry's `LdrpHashTable` bucket linkage when it can
+  be positively identified (Flink/Blink round-trip validation; skipped with a
+  warning otherwise, and skipped entirely on builds that don't export the
+  table) – never unlinked on a guess.
 - **DLL hollowing** maps the carrier with `NtCreateSection(SEC_IMAGE)` from a
   real signed file handle (never a handle-less section), verifies the view fits
   the payload, then applies the same relocation/import/TLS/exception validation

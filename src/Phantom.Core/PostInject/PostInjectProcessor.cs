@@ -46,8 +46,15 @@ public static class PostInjectProcessor
                 // top-level error; convert any failure into a warning.
                 try
                 {
-                    if (!LoaderLockUnlink.TryUnlink(pid, hProcess, moduleBase, out var hideError))
+                    if (!LoaderLockUnlink.TryUnlink(pid, hProcess, moduleBase, out var hideError, out var hashNote))
+                    {
                         failures.Add("hide module (" + (hideError ?? "failed") + ")");
+                    }
+                    else if (hashNote is not null)
+                    {
+                        // Lists unlinked; hash-table cloaking skipped — warning only.
+                        failures.Add("hide module hash (" + hashNote + ")");
+                    }
                 }
                 catch (Exception ex)
                 {

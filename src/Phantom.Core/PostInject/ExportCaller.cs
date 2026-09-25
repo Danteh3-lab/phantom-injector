@@ -243,7 +243,7 @@ public static class ExportCaller
         if (!indeterminate)
         {
             foreach (var alloc in allocations)
-                DirectSyscalls.NtFreeVirtualMemory(hProcess, alloc);
+                SectionMemory.Free(hProcess, alloc);
         }
 
         NativeMethods.CloseHandle(hProcess);
@@ -302,12 +302,7 @@ public static class ExportCaller
 
     private static IntPtr AllocWrite(IntPtr hProcess, byte[] data, List<IntPtr> allocations, uint protect = NativeConstants.PAGE_READWRITE)
     {
-        var baseAddr = IntPtr.Zero;
-        var region = (UIntPtr)(uint)data.Length;
-        var allocStatus = DirectSyscalls.NtAllocateVirtualMemory(hProcess, ref baseAddr, IntPtr.Zero,
-            ref region, NativeConstants.MEM_COMMIT | NativeConstants.MEM_RESERVE, protect);
-        if (allocStatus != 0 || baseAddr == IntPtr.Zero)
-            throw new InvalidOperationException($"NtAllocateVirtualMemory failed: 0x{allocStatus:X8}");
+        var baseAddr = SectionMemory.Allocate(hProcess, data.Length, protect);
 
         allocations.Add(baseAddr);
         if (DirectSyscalls.NtWriteVirtualMemory(hProcess, baseAddr, data, out var written) != 0 ||

@@ -584,7 +584,7 @@ internal sealed unsafe class ModuleStompingInjector : InjectorBase
                 sleepFunction, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
 
             dataRegion = SyscallAlloc(hProcess, slotsSize);
-            codeRegion = SyscallAlloc(hProcess, placeholder.Length);
+            codeRegion = SyscallAllocCode(hProcess, placeholder.Length);
             var resultAddress = dataRegion;
             var doneAddress = IntPtr.Add(dataRegion, 8);
             var cookieAddress = IntPtr.Add(dataRegion, 16);
@@ -808,21 +808,15 @@ internal sealed unsafe class ModuleStompingInjector : InjectorBase
     #region syscall-backed remote helpers
 
     private static IntPtr SyscallAlloc(IntPtr hProcess, int size)
-    {
-        var baseAddr = IntPtr.Zero;
-        var region = (UIntPtr)(uint)size;
-        var status = DirectSyscalls.NtAllocateVirtualMemory(hProcess, ref baseAddr, IntPtr.Zero,
-            ref region, NativeConstants.MEM_COMMIT | NativeConstants.MEM_RESERVE, NativeConstants.PAGE_READWRITE);
-        if (status != 0 || baseAddr == IntPtr.Zero)
-            throw new InvalidOperationException($"NtAllocateVirtualMemory failed: 0x{status:X8}");
-        return baseAddr;
-    }
+        => SectionMemory.Allocate(hProcess, size, NativeConstants.PAGE_READWRITE);
+
+    // Code regions are backed executable from creation: a view mapped from a
+    // non-executable section can never transition to RX later.
+    private static IntPtr SyscallAllocCode(IntPtr hProcess, int size)
+        => SectionMemory.Allocate(hProcess, size, NativeConstants.PAGE_EXECUTE_READWRITE);
 
     private static void SyscallFree(IntPtr hProcess, IntPtr address)
-    {
-        if (address != IntPtr.Zero)
-            DirectSyscalls.NtFreeVirtualMemory(hProcess, address);
-    }
+        => SectionMemory.Free(hProcess, address);
 
     private static void FreeStubRegions(IntPtr hProcess, ref IntPtr dataRegion, ref IntPtr codeRegion)
     {

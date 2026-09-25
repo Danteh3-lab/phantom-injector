@@ -774,14 +774,7 @@ internal sealed class ManualMapInjector : InjectorBase
         => length == 0 || RangeInImage(rva, length, sizeOfImage);
 
     private static IntPtr TryAllocateAt(IntPtr hProcess, IntPtr preferredBase, int size)
-    {
-        var baseAddr = preferredBase;
-        var region = (UIntPtr)(uint)size;
-        var status = DirectSyscalls.NtAllocateVirtualMemory(hProcess, ref baseAddr, IntPtr.Zero,
-            ref region, NativeConstants.MEM_COMMIT | NativeConstants.MEM_RESERVE,
-            NativeConstants.PAGE_EXECUTE_READWRITE);
-        return status == 0 ? baseAddr : IntPtr.Zero;
-    }
+        => SectionMemory.AllocateAt(hProcess, size, NativeConstants.PAGE_EXECUTE_READWRITE, preferredBase);
 
     private static void ProtectRemote(IntPtr hProcess, IntPtr address, int size, uint protect, string what)
     {
