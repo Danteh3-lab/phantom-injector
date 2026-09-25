@@ -26,7 +26,7 @@ internal sealed class StandardInjector : InjectorBase
             // The wrapper records the full 64-bit HMODULE, so success and the
             // returned base are authoritative for the exact path requested.
             var moduleBase = RemoteLoadLibraryResult(hProcess, pid, dllPath, options.TimeoutMs,
-                out var resultUnknown, out var unsafeToFree, out var threadId);
+                out var resultUnknown, out var unsafeToFree, out var threadId, out var createStatus);
 
             if (unsafeToFree)
                 return InjectionResult.Fail(Method, dllPath,
@@ -37,8 +37,15 @@ internal sealed class StandardInjector : InjectorBase
                     "The module load result could not be read; the outcome is unknown.");
 
             if (moduleBase == IntPtr.Zero)
+            {
+                // Creation failure and a completed load returning NULL are
+                // different diagnoses: report them distinctly.
+                if (createStatus != 0)
+                    return InjectionResult.Fail(Method, dllPath,
+                        $"Remote thread creation failed: {NtStatus.Describe(createStatus)}.");
                 return InjectionResult.Fail(Method, dllPath,
                     "LoadLibraryW returned NULL in the target. Check the file path and bitness.");
+            }
 
             return InjectionResult.Ok(Method, dllPath, moduleBase, threadId);
         }

@@ -30,6 +30,16 @@ is a clean-room re-implementation of the feature set described in its README.
 - **Section-backed scratch memory** – all temporary remote buffers (stubs,
   slots, images) are pagefile section mappings, never private `VirtualAlloc`
   memory
+- **Preflight access probe** – before injecting (and before the architecture
+  check, so access failures can't hide as "not AMD64"), the granted handle
+  rights are queried and compared against the exact mask the method opens with
+  (single source of truth per method). Kernel protections (e.g. anti-cheat
+  object callbacks) that strip rights produce one actionable failure naming the
+  missing rights; an unqueryable handle fails closed as "rights unverified"
+  rather than a false defense win. Only the pure-hijack path omits
+  `PROCESS_CREATE_THREAD` (hollowing/stomping still create threads for imports).
+  Failures carry classified NTSTATUS names (`ACCESS_DENIED`, …), and a failed
+  remote-thread creation is reported distinctly from a load that returned NULL
 - **Multi-DLL** queue with per-DLL enable/disable, drag & drop
 - **Auto-inject** when the target process starts
 - **Close on inject**

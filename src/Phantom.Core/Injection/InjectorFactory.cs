@@ -17,9 +17,38 @@ public static class Injector
             return InjectionResult.Fail(options.Method, dllPath,
                 "LdrpLoadDll is not supported on modern Windows and is disabled.");
 
-        if (!ProcessManager.IsAmd64Target(pid))
+        // Access probe FIRST: the architecture query cannot distinguish a
+        // denied open from a non-AMD64 target, so an access failure must be
+        // reported as such instead of hiding behind "not AMD64".
+        var preflight = TargetPreflight.Check(pid, RequiredAccess(options.Method));
+        if (preflight.ProbeError is not null)
             return InjectionResult.Fail(options.Method, dllPath,
-                "The target is not a native AMD64 process, or its architecture could not be determined. Phantom is x64-only.");
+                "Preflight probe failed: " + preflight.ProbeError);
+        if (!preflight.Opened)
+            return InjectionResult.Fail(options.Method, dllPath,
+                $"Preflight: target could not be opened ({NtStatus.Describe(preflight.OpenStatus)}). " +
+                "It may be protected, elevated above this process, or already gone.");
+        if (!preflight.RightsQueried)
+            return InjectionResult.Fail(options.Method, dllPath,
+                $"Preflight: handle rights could not be verified ({NtStatus.Describe(preflight.QueryStatus)}). " +
+                "Failing closed rather than attributing this to target protection.");
+        if (preflight.Missing.Length > 0)
+            return InjectionResult.Fail(options.Method, dllPath,
+                $"Preflight: handle rights stripped by the target's protection " +
+                $"(missing: {string.Join(", ", preflight.Missing)}; granted: 0x{preflight.Granted:X8}). " +
+                $"{options.Method} cannot proceed without them; check driver callbacks.");
+
+        switch (ProcessManager.CheckArchitecture(pid))
+        {
+            case ProcessManager.ArchCheckResult.NotAmd64:
+                return InjectionResult.Fail(options.Method, dllPath,
+                    "The target is not a native AMD64 process. Phantom is x64-only.");
+            case ProcessManager.ArchCheckResult.Unknown:
+                return InjectionResult.Fail(options.Method, dllPath,
+                    "The target architecture could not be queried (it may have exited). Failing closed.");
+            default:
+                break;
+        }
 
         IInjector injector = options.Method switch
         {
@@ -31,6 +60,25 @@ public static class Injector
             InjectionMethod.ModuleStomping => new ModuleStompingInjector(),
             _ => new StandardInjector()
         };
+
+        return RunInjector(injector, pid, dllPath, options);
+    }
+
+    /// <summary>
+    /// Handle rights each method's actual open requests — the same masks the
+    /// injectors open with (single source of truth in <see cref="InjectorBase"/>).
+    /// DllHollowing/ModuleStomping resolve imports and release dependencies via
+    /// remote threads, so they require CREATE_THREAD like the loader methods.
+    /// Only the pure-hijack core path omits it.
+    /// </summary>
+    private static uint RequiredAccess(InjectionMethod method) => method switch
+    {
+        InjectionMethod.ThreadHijack => InjectorBase.HijackAccess,
+        _ => InjectorBase.InjectionAccess,
+    };
+
+    private static InjectionResult RunInjector(IInjector injector, uint pid, string dllPath, InjectionOptions options)
+    {
 
         var result = injector.Inject(pid, dllPath, options);
 

@@ -59,7 +59,7 @@ internal sealed class LdrLoadDllInjector : InjectorBase
                     "Injection did not complete (timeout or wait failure); the remote thread may still be running so its buffers were left intact.");
 
             if (!remoteThread.Created)
-                return InjectionResult.Fail(Method, dllPath, "NtCreateThreadEx failed in the target.");
+                return InjectionResult.Fail(Method, dllPath, $"NtCreateThreadEx failed in the target: {NtStatus.Describe(remoteThread.Status)}.");
 
             // NTSTATUS_SUCCESS == 0
             if (remoteThread.ExitCode != 0)

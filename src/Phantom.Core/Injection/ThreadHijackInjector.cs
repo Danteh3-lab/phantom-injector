@@ -34,7 +34,9 @@ internal sealed unsafe class ThreadHijackInjector : InjectorBase
         {
             try
             {
-                hProcess = OpenRemoteProcess(pid, InjectionAccess);
+                // Hijack core path creates no remote threads: open without
+                // CREATE_THREAD (matches the preflight gate exactly).
+                hProcess = OpenRemoteProcess(pid, HijackAccess);
             }
             catch (Exception ex)
             {

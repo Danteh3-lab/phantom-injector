@@ -27,13 +27,8 @@ internal sealed unsafe class ModuleStompingInjector : InjectorBase
 {
     public override InjectionMethod Method => InjectionMethod.ModuleStomping;
 
-    private const uint ProcessAccess =
-        NativeConstants.PROCESS_CREATE_THREAD |
-        NativeConstants.PROCESS_QUERY_INFORMATION |
-        NativeConstants.PROCESS_VM_OPERATION |
-        NativeConstants.PROCESS_VM_WRITE |
-        NativeConstants.PROCESS_VM_READ;
-
+    // Process open uses InjectorBase.InjectionAccess (includes CREATE_THREAD:
+    // import resolution and dependency release create remote threads).
     private const uint ThreadAccess =
         NativeConstants.THREAD_SUSPEND_RESUME |
         NativeConstants.THREAD_GET_CONTEXT |
@@ -63,7 +58,7 @@ internal sealed unsafe class ModuleStompingInjector : InjectorBase
 
             try
             {
-                hProcess = OpenRemoteProcess(pid, ProcessAccess);
+                hProcess = OpenRemoteProcess(pid, InjectionAccess);
             }
             catch (Exception ex)
             {
@@ -1034,7 +1029,7 @@ internal sealed unsafe class ModuleStompingInjector : InjectorBase
     private static (IntPtr Base, bool TimedOut) RemoteLoadLibrary(IntPtr hProcess, uint pid, string moduleName, int timeoutMs)
     {
         var baseAddr = RemoteLoadLibraryResult(hProcess, pid, moduleName, timeoutMs,
-            out _, out var unsafeToFree, out _);
+            out _, out var unsafeToFree, out _, out _);
         return (baseAddr, unsafeToFree);
     }
 

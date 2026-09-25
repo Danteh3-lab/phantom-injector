@@ -69,6 +69,9 @@ internal readonly struct RemoteThreadResult
     public uint ExitCode { get; init; }
     public uint ThreadId { get; init; }
 
+    /// <summary>Creation NTSTATUS; meaningful when <see cref="Created"/> is false.</summary>
+    public int Status { get; init; }
+
     public bool UnsafeToFree => TimedOut || WaitFailed;
 }
 

@@ -181,7 +181,7 @@ internal sealed class ManualMapInjector : InjectorBase
             }
 
             if (!init.Created)
-                return FailMapping("NtCreateThreadEx failed in the target.");
+                return FailMapping($"NtCreateThreadEx failed in the target: {NtStatus.Describe(init.Status)}.");
 
             if (!TryReadRemoteInt64(hProcess, completionAddress, out var completion) || completion == 0)
             {
@@ -294,7 +294,7 @@ internal sealed class ManualMapInjector : InjectorBase
 
             if (!exec.Created)
             {
-                error = "NtCreateThreadEx failed while releasing a dependency";
+                error = $"NtCreateThreadEx failed while releasing a dependency: {NtStatus.Describe(exec.Status)}";
                 return false;
             }
 
@@ -568,7 +568,7 @@ internal sealed class ManualMapInjector : InjectorBase
         // Only "thread may still execute" maps to TimedOut; that is a dependency
         // hazard, so the image itself is still safe to release.
         var baseAddress = RemoteLoadLibraryResult(hProcess, pid, moduleName, timeoutMs,
-            out _, out var unsafeToFree, out _);
+            out _, out var unsafeToFree, out _, out _);
         return (baseAddress, unsafeToFree);
     }
 

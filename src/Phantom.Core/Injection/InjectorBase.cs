@@ -14,8 +14,20 @@ internal abstract class InjectorBase : IInjector
 
     public abstract InjectionResult Inject(uint pid, string dllPath, InjectionOptions options);
 
-    protected const uint InjectionAccess =
+    internal const uint InjectionAccess =
         NativeConstants.PROCESS_CREATE_THREAD |
+        NativeConstants.PROCESS_QUERY_INFORMATION |
+        NativeConstants.PROCESS_VM_OPERATION |
+        NativeConstants.PROCESS_VM_WRITE |
+        NativeConstants.PROCESS_VM_READ;
+
+    /// <summary>
+    /// Open mask for the pure-hijack core path, which never creates a remote
+    /// thread. Single source of truth shared by ThreadHijack's actual open
+    /// and the preflight gate, so a stripped CREATE_THREAD cannot false-block
+    /// a method that never uses it.
+    /// </summary>
+    internal const uint HijackAccess =
         NativeConstants.PROCESS_QUERY_INFORMATION |
         NativeConstants.PROCESS_VM_OPERATION |
         NativeConstants.PROCESS_VM_WRITE |
@@ -28,7 +40,7 @@ internal abstract class InjectorBase : IInjector
     {
         var status = DirectSyscalls.NtOpenProcessByPid(out var hProcess, access, pid);
         if (status != 0 || hProcess == IntPtr.Zero)
-            throw new InvalidOperationException($"NtOpenProcess failed: 0x{status:X8}");
+            throw new InvalidOperationException($"NtOpenProcess failed: {NtStatus.Describe(status)}");
         return hProcess;
     }
 
@@ -114,14 +126,17 @@ internal abstract class InjectorBase : IInjector
     /// <paramref name="unsafeToFree"/> means the remote thread may still be
     /// executing, so its buffers must be left mapped; <paramref name="resultUnknown"/>
     /// means the thread finished but the recorded result could not be read
-    /// (its buffers are safe to release).
+    /// (its buffers are safe to release). <paramref name="createStatus"/> carries
+    /// the thread-creation NTSTATUS so callers can tell a failed creation apart
+    /// from a completed load that returned NULL.
     /// </summary>
     protected static IntPtr RemoteLoadLibraryResult(IntPtr hProcess, uint pid, string pathOrName,
-        int timeoutMs, out bool resultUnknown, out bool unsafeToFree, out uint threadId)
+        int timeoutMs, out bool resultUnknown, out bool unsafeToFree, out uint threadId, out int createStatus)
     {
         resultUnknown = false;
         unsafeToFree = false;
         threadId = 0;
+        createStatus = 0;
 
         var remotePath = IntPtr.Zero;
         var resultAddress = IntPtr.Zero;
@@ -140,6 +155,7 @@ internal abstract class InjectorBase : IInjector
 
             var exec = RunRemoteThread(hProcess, stubAddress, IntPtr.Zero, timeoutMs);
             threadId = exec.ThreadId;
+            createStatus = exec.Status;
 
             if (exec.UnsafeToFree)
             {
@@ -197,7 +213,7 @@ internal abstract class InjectorBase : IInjector
             IntPtr.Zero, hProcess, start, parameter, 0,
             IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
         if (status != 0 || hThread == IntPtr.Zero)
-            return new RemoteThreadResult { Created = false };
+            return new RemoteThreadResult { Created = false, Status = status };
 
         // NtCreateThreadEx reports no TID: query it via syscall instead of
         // falling back to a hooked Win32 lookup. Strictly informational, so a

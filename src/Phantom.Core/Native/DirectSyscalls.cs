@@ -57,6 +57,9 @@ internal static class DirectSyscalls
     private delegate int NtFlushInstructionCacheDelegate(IntPtr ProcessHandle, IntPtr BaseAddress, UIntPtr Length);
 
     [UnmanagedFunctionPointer(CallingConvention.StdCall)]
+    private delegate int NtQueryObjectDelegate(IntPtr Handle, int ObjectInformationClass, IntPtr ObjectInformation, int ObjectInformationLength, out int ReturnLength);
+
+    [UnmanagedFunctionPointer(CallingConvention.StdCall)]
     private delegate int NtCreateSectionDelegate(out IntPtr SectionHandle, uint DesiredAccess, IntPtr ObjectAttributes, IntPtr MaximumSize, uint SectionPageProtection, uint AllocationAttributes, IntPtr FileHandle);
 
     [UnmanagedFunctionPointer(CallingConvention.StdCall)]
@@ -639,6 +642,36 @@ internal static class DirectSyscalls
             if (status != 0)
                 return status;
             pebBase = Marshal.PtrToStructure<PROCESS_BASIC_INFORMATION>(buf).PebBaseAddress;
+            return 0;
+        }
+        finally
+        {
+            Marshal.FreeHGlobal(buf);
+        }
+    }
+
+    public static int NtQueryObject(IntPtr handle, int objectInformationClass, IntPtr objectInformation, int objectInformationLength, out int returnLength)
+    {
+        var stub = GetSyscallStub("NtQueryObject");
+        var del = Marshal.GetDelegateForFunctionPointer<NtQueryObjectDelegate>(stub);
+        return del(handle, objectInformationClass, objectInformation, objectInformationLength, out returnLength);
+    }
+
+    /// <summary>
+    /// Queries ObjectBasicInformation (class 0) and returns the handle's
+    /// granted access mask. Reads GrantedAccess at its stable offset (+4)
+    /// instead of marshalling the version-dependent full struct.
+    /// </summary>
+    public static int NtQueryGrantedAccess(IntPtr handle, out uint grantedAccess)
+    {
+        grantedAccess = 0;
+        var buf = Marshal.AllocHGlobal(64);
+        try
+        {
+            var status = NtQueryObject(handle, 0, buf, 64, out _);
+            if (status != 0)
+                return status;
+            grantedAccess = (uint)Marshal.ReadInt32(buf, 4);
             return 0;
         }
         finally

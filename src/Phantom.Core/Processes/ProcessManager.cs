@@ -108,16 +108,32 @@ public static class ProcessManager
         };
     }
 
+    public enum ArchCheckResult
+    {
+        Amd64,
+        NotAmd64,
+        Unknown,
+    }
+
     /// <summary>
     /// Returns true only when the target is a native AMD64 process on an AMD64
     /// host. Any other architecture, or a target whose architecture cannot be
     /// determined, returns false (fail closed).
     /// </summary>
-    public static bool IsAmd64Target(uint pid)
+    public static bool IsAmd64Target(uint pid) => CheckArchitecture(pid) == ArchCheckResult.Amd64;
+
+    /// <summary>
+    /// Three-way architecture check: distinguishes "definitely not AMD64"
+    /// from "could not be queried" (no handle, exited target, missing APIs).
+    /// The handle is opened via direct syscall so an access failure here is
+    /// genuine, not a hook artifact.
+    /// </summary>
+    public static ArchCheckResult CheckArchitecture(uint pid)
     {
-        var hProcess = NativeMethods.OpenProcess(NativeConstants.PROCESS_QUERY_LIMITED_INFORMATION, false, pid);
-        if (hProcess == IntPtr.Zero)
-            return false;
+        if (DirectSyscalls.NtOpenProcessByPid(out var hProcess,
+                NativeConstants.PROCESS_QUERY_LIMITED_INFORMATION, pid) != 0 ||
+            hProcess == IntPtr.Zero)
+            return ArchCheckResult.Unknown;
 
         try
         {
@@ -127,7 +143,9 @@ public static class ProcessManager
             try
             {
                 if (NativeMethods.IsWow64Process2(hProcess, out var processMachine, out var nativeMachine))
-                    return processMachine == 0 && nativeMachine == NativeConstants.IMAGE_FILE_MACHINE_AMD64;
+                    return processMachine == 0 && nativeMachine == NativeConstants.IMAGE_FILE_MACHINE_AMD64
+                        ? ArchCheckResult.Amd64
+                        : ArchCheckResult.NotAmd64;
             }
             catch (EntryPointNotFoundException)
             {
@@ -137,9 +155,9 @@ public static class ProcessManager
             // Fallback for older systems: the injector itself is AMD64, so a
             // non-WOW64 target on such a system is an AMD64 process.
             if (NativeMethods.IsWow64Process(hProcess, out var wow64))
-                return !wow64;
+                return wow64 ? ArchCheckResult.NotAmd64 : ArchCheckResult.Amd64;
 
-            return false;
+            return ArchCheckResult.Unknown;
         }
         finally
         {
