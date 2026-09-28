@@ -266,6 +266,15 @@ internal struct LIST_ENTRY
 
 internal static class NativeMethods
 {
+    [DllImport("kernel32.dll")]
+    internal static extern IntPtr GetCurrentProcess();
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static extern bool DuplicateHandle(IntPtr hSourceProcessHandle, IntPtr hSourceHandle,
+        IntPtr hTargetProcessHandle, out IntPtr lpTargetHandle, uint dwDesiredAccess,
+        [MarshalAs(UnmanagedType.Bool)] bool bInheritHandle, uint dwOptions);
+
     [DllImport("kernel32.dll", SetLastError = true)]
     internal static extern uint GetProcessId(IntPtr process);
 

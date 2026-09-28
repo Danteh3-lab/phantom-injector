@@ -72,7 +72,11 @@ public static class Injector
             _ => new StandardInjector()
         };
 
-        return RunInjector(injector, target, dllPath, options);
+        using var cleanupScope = SectionMemory.BeginCleanupScope();
+        var result = RunInjector(injector, target, dllPath, options);
+        if (cleanupScope.FailureMessage is { } cleanupFailure)
+            result.AddCleanupFailure(cleanupFailure);
+        return result;
     }
 
     /// <summary>

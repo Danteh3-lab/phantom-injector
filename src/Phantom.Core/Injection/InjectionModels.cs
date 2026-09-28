@@ -35,12 +35,14 @@ public sealed class InjectionOptions
 /// </summary>
 public sealed class InjectionResult
 {
+    private string? _error;
+
     public bool Success { get; init; }
     public InjectionMethod Method { get; init; }
     public string DllPath { get; init; } = string.Empty;
     public IntPtr ModuleBase { get; init; }
     public uint RemoteThreadId { get; init; }
-    public string? Error { get; init; }
+    public string? Error { get => _error; init => _error = value; }
     public uint ErrorCode { get; init; }
 
     /// <summary>
@@ -48,6 +50,14 @@ public sealed class InjectionResult
     /// was requested but did not complete).
     /// </summary>
     public string? Warning { get; set; }
+
+    internal void AddCleanupFailure(string message)
+    {
+        if (Success)
+            Warning = Warning is null ? message : Warning + " " + message;
+        else
+            _error = _error is null ? message : _error + " " + message;
+    }
 
     public static InjectionResult Ok(InjectionMethod method, string dll, IntPtr baseAddr, uint tid = 0)
         => new() { Success = true, Method = method, DllPath = dll, ModuleBase = baseAddr, RemoteThreadId = tid };

@@ -120,7 +120,7 @@ internal abstract class InjectorBase : IInjector
         return resolved;
     }
 
-    protected static void FreeRemote(IntPtr hProcess, IntPtr address)
+    protected static SectionMemory.FreeResult FreeRemote(IntPtr hProcess, IntPtr address)
         => SectionMemory.Free(hProcess, address);
 
     protected static bool TryReadRemoteInt64(IntPtr hProcess, IntPtr address, out long value)

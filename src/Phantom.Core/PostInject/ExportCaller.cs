@@ -7,10 +7,21 @@ namespace Phantom.Core.PostInject;
 
 public sealed class ExportCallResult
 {
+    private string? _error;
+
     public bool Success { get; init; }
     public IntPtr FunctionAddress { get; init; }
     public ulong ReturnValue { get; init; }
-    public string? Error { get; init; }
+    public string? Error { get => _error; init => _error = value; }
+    public string? Warning { get; private set; }
+
+    internal void AddCleanupFailure(string message)
+    {
+        if (Success)
+            Warning = Warning is null ? message : Warning + " " + message;
+        else
+            _error = _error is null ? message : _error + " " + message;
+    }
 }
 
 /// <summary>
@@ -25,7 +36,8 @@ public static class ExportCaller
         NativeConstants.PROCESS_QUERY_INFORMATION |
         NativeConstants.PROCESS_VM_OPERATION |
         NativeConstants.PROCESS_VM_WRITE |
-        NativeConstants.PROCESS_VM_READ;
+        NativeConstants.PROCESS_VM_READ |
+        NativeConstants.SYNCHRONIZE;
 
     /// <summary>
     /// Resolves an export through the target's GetProcAddress and calls it.
@@ -33,6 +45,16 @@ public static class ExportCaller
     /// </summary>
     public static ExportCallResult Call(uint pid, IntPtr moduleBase, string functionName,
         IReadOnlyList<string> args, int timeoutMs = 10_000)
+    {
+        using var cleanupScope = SectionMemory.BeginCleanupScope();
+        var result = CallCore(pid, moduleBase, functionName, args, timeoutMs);
+        if (cleanupScope.FailureMessage is { } cleanupFailure)
+            result.AddCleanupFailure(cleanupFailure);
+        return result;
+    }
+
+    private static ExportCallResult CallCore(uint pid, IntPtr moduleBase, string functionName,
+        IReadOnlyList<string> args, int timeoutMs)
     {
         IntPtr hProcess = IntPtr.Zero;
         var allocations = new List<IntPtr>();
@@ -95,6 +117,16 @@ public static class ExportCaller
     /// </summary>
     public static ExportCallResult CallByAddress(uint pid, IntPtr functionAddress,
         IReadOnlyList<string> args, int timeoutMs = 10_000)
+    {
+        using var cleanupScope = SectionMemory.BeginCleanupScope();
+        var result = CallByAddressCore(pid, functionAddress, args, timeoutMs);
+        if (cleanupScope.FailureMessage is { } cleanupFailure)
+            result.AddCleanupFailure(cleanupFailure);
+        return result;
+    }
+
+    private static ExportCallResult CallByAddressCore(uint pid, IntPtr functionAddress,
+        IReadOnlyList<string> args, int timeoutMs)
     {
         IntPtr hProcess = IntPtr.Zero;
         var allocations = new List<IntPtr>();

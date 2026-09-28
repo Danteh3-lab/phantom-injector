@@ -704,7 +704,7 @@ internal sealed unsafe class DllHollowingInjector : InjectorBase
     private static IntPtr SyscallAllocCode(IntPtr hProcess, int size)
         => SectionMemory.Allocate(hProcess, size, NativeConstants.PAGE_EXECUTE_READWRITE);
 
-    private static void SyscallFree(IntPtr hProcess, IntPtr address)
+    private static SectionMemory.FreeResult SyscallFree(IntPtr hProcess, IntPtr address)
         => SectionMemory.Free(hProcess, address);
 
     private static void SyscallWrite(IntPtr hProcess, IntPtr address, byte[] data)
@@ -728,10 +728,10 @@ internal sealed unsafe class DllHollowingInjector : InjectorBase
 
     private static void FreeStubRegions(IntPtr hProcess, ref IntPtr dataRegion, ref IntPtr codeRegion)
     {
-        SyscallFree(hProcess, dataRegion);
-        dataRegion = IntPtr.Zero;
-        SyscallFree(hProcess, codeRegion);
-        codeRegion = IntPtr.Zero;
+        if (SyscallFree(hProcess, dataRegion).Succeeded)
+            dataRegion = IntPtr.Zero;
+        if (SyscallFree(hProcess, codeRegion).Succeeded)
+            codeRegion = IntPtr.Zero;
     }
 
     private static void MakeImageWritable(IntPtr hProcess, IntPtr baseAddress, int size)

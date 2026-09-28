@@ -63,7 +63,6 @@ internal static class LoaderLockUnlink
             hashNote = "LdrpHashTable not exported on this build; PEB lists unlinked only.";
 
         const int regionSize = 0x200;
-        const int stubOffset = 16;
 
         IntPtr region;
         try
@@ -77,80 +76,108 @@ internal static class LoaderLockUnlink
         }
 
         var keepMapped = false;
+        var unlinked = false;
         try
         {
-            var statusAddress = region;
-            var stub = BuildStub(listHead, moduleBase, lockFunction, unlockFunction, statusAddress,
-                hashTable, hashTable == IntPtr.Zero ? 0 : hashTable.ToInt64() + HashTableBounds);
+            unlinked = ExecuteStub(hProcess, moduleBase, region, listHead, lockFunction,
+                unlockFunction, hashTable, out keepMapped, out error, out hashNote);
+        }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+        }
 
-            if (DirectSyscalls.NtWriteVirtualMemory(hProcess, statusAddress, new byte[8], out _) != 0 ||
-                DirectSyscalls.NtWriteVirtualMemory(hProcess, IntPtr.Add(region, stubOffset), stub, out _) != 0)
+        if (!keepMapped)
+        {
+            var cleanup = SectionMemory.Free(hProcess, region);
+            if (!cleanup.Succeeded && !SectionMemory.IsCleanupScopeActive)
             {
-                error = "NtWriteVirtualMemory failed.";
+                var cleanupError = cleanup.Describe(region);
+                error = error is null ? cleanupError : error + " Cleanup also failed: " + cleanupError;
                 return false;
-            }
-
-            try
-            {
-                NativeMethods.FlushInstructionCacheChecked(hProcess, IntPtr.Add(region, stubOffset), stub.Length);
-            }
-            catch (Exception ex)
-            {
-                error = ex.Message;
-                return false;
-            }
-
-            var createStatus = DirectSyscalls.NtCreateThreadEx(out var hThread, NativeConstants.THREAD_ALL_ACCESS,
-                IntPtr.Zero, hProcess, IntPtr.Add(region, stubOffset), IntPtr.Zero, 0,
-                IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
-            if (createStatus != 0 || hThread == IntPtr.Zero)
-            {
-                error = $"NtCreateThreadEx failed: 0x{createStatus:X8}";
-                return false;
-            }
-
-            var wait = NativeMethods.WaitForSingleObject(hThread, TimeoutMs);
-            NativeMethods.CloseHandle(hThread);
-
-            if (wait == NativeConstants.WAIT_TIMEOUT || wait == NativeConstants.WAIT_FAILED)
-            {
-                // The loader-lock stub may still be running; leave it mapped.
-                keepMapped = true;
-                error = "loader-lock operation did not complete; stub left mapped";
-                return false;
-            }
-
-            var statusBuffer = new byte[8];
-            var status = DirectSyscalls.NtReadVirtualMemory(hProcess, statusAddress, statusBuffer, out var read) == 0 &&
-                         read.ToUInt64() == 8
-                ? BitConverter.ToInt64(statusBuffer, 0)
-                : 0;
-
-            switch (status)
-            {
-                case StatusUnlinked:
-                    return true;
-                case StatusListsOnlyNoHash:
-                    hashNote ??= "entry hash linkage not verified on this build; PEB lists unlinked only.";
-                    return true;
-                case StatusNotFound:
-                    error = "module was not present in the loader list";
-                    return false;
-                case StatusLockFailed:
-                    error = "could not acquire the target loader lock";
-                    return false;
-                case StatusUnlockFailed:
-                    error = "the target loader lock could not be released";
-                    return false;
-                default:
-                    error = "loader-lock stub produced no usable result";
-                    return false;
             }
         }
-        finally
+
+        return unlinked;
+    }
+
+    private static bool ExecuteStub(IntPtr hProcess, IntPtr moduleBase, IntPtr region,
+        IntPtr listHead, IntPtr lockFunction, IntPtr unlockFunction, IntPtr hashTable,
+        out bool keepMapped, out string? error, out string? hashNote)
+    {
+        keepMapped = false;
+        error = null;
+        hashNote = null;
+        const int stubOffset = 16;
+        if (hashTable == IntPtr.Zero)
+            hashNote = "LdrpHashTable not exported on this build; PEB lists unlinked only.";
+
+        var statusAddress = region;
+        var stub = BuildStub(listHead, moduleBase, lockFunction, unlockFunction, statusAddress,
+            hashTable, hashTable == IntPtr.Zero ? 0 : hashTable.ToInt64() + HashTableBounds);
+
+        if (DirectSyscalls.NtWriteVirtualMemory(hProcess, statusAddress, new byte[8], out _) != 0 ||
+            DirectSyscalls.NtWriteVirtualMemory(hProcess, IntPtr.Add(region, stubOffset), stub, out _) != 0)
         {
-            if (!keepMapped)
-                SectionMemory.Free(hProcess, region);
+            error = "NtWriteVirtualMemory failed.";
+            return false;
+        }
+
+        try
+        {
+            NativeMethods.FlushInstructionCacheChecked(hProcess, IntPtr.Add(region, stubOffset), stub.Length);
+        }
+        catch (Exception ex)
+        {
+            error = ex.Message;
+            return false;
+        }
+
+        var createStatus = DirectSyscalls.NtCreateThreadEx(out var hThread, NativeConstants.THREAD_ALL_ACCESS,
+            IntPtr.Zero, hProcess, IntPtr.Add(region, stubOffset), IntPtr.Zero, 0,
+            IntPtr.Zero, IntPtr.Zero, IntPtr.Zero, IntPtr.Zero);
+        if (createStatus != 0 || hThread == IntPtr.Zero)
+        {
+            error = $"NtCreateThreadEx failed: 0x{createStatus:X8}";
+            return false;
+        }
+
+        var wait = NativeMethods.WaitForSingleObject(hThread, TimeoutMs);
+        NativeMethods.CloseHandle(hThread);
+
+        if (wait == NativeConstants.WAIT_TIMEOUT || wait == NativeConstants.WAIT_FAILED)
+        {
+            // The loader-lock stub may still be running; leave it mapped.
+            keepMapped = true;
+            error = "loader-lock operation did not complete; stub left mapped";
+            return false;
+        }
+
+        var statusBuffer = new byte[8];
+        var status = DirectSyscalls.NtReadVirtualMemory(hProcess, statusAddress, statusBuffer, out var read) == 0 &&
+                     read.ToUInt64() == 8
+            ? BitConverter.ToInt64(statusBuffer, 0)
+            : 0;
+
+        switch (status)
+        {
+            case StatusUnlinked:
+                return true;
+            case StatusListsOnlyNoHash:
+                hashNote ??= "entry hash linkage not verified on this build; PEB lists unlinked only.";
+                return true;
+            case StatusNotFound:
+                error = "module was not present in the loader list";
+                return false;
+            case StatusLockFailed:
+                error = "could not acquire the target loader lock";
+                return false;
+            case StatusUnlockFailed:
+                error = "the target loader lock could not be released";
+                return false;
+            default:
+                error = "loader-lock stub produced no usable result";
+                return false;
         }
     }
 

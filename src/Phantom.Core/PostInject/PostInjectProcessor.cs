@@ -65,8 +65,8 @@ public static class PostInjectProcessor
         {
             var failures = new List<string>();
 
-            if (options.ErasePeHeaders && !EraseHeaders(hProcess, moduleBase))
-                failures.Add("erase PE headers");
+            if (options.ErasePeHeaders && !EraseHeaders(hProcess, moduleBase, out var eraseError))
+                failures.Add("erase PE headers (" + eraseError + ")");
 
             if (options.HideModule)
             {
@@ -98,21 +98,142 @@ public static class PostInjectProcessor
         }
     }
 
-    private static bool EraseHeaders(IntPtr hProcess, IntPtr moduleBase)
+    private static bool EraseHeaders(IntPtr hProcess, IntPtr moduleBase, out string error)
     {
         const int size = 0x1000;
+        var backup = new byte[size];
+        int readStatus;
+        UIntPtr bytesRead;
+        try
+        {
+            readStatus = DirectSyscalls.NtReadVirtualMemory(hProcess, moduleBase, backup, out bytesRead);
+        }
+        catch (Exception ex)
+        {
+            error = "could not capture the original 4096 bytes: " + ex.Message;
+            return false;
+        }
+
+        if (readStatus != 0 || bytesRead.ToUInt64() != (ulong)size)
+        {
+            error = $"could not capture the original 4096 bytes (NTSTATUS 0x{readStatus:X8}, read {bytesRead.ToUInt64()}/{size} bytes)";
+            return false;
+        }
+
         var baseAddr = moduleBase;
         var region = (UIntPtr)size;
-        if (DirectSyscalls.NtProtectVirtualMemory(hProcess, ref baseAddr, ref region,
-                NativeConstants.PAGE_READWRITE, out var oldProtect) != 0)
+        uint oldProtect;
+        int protectStatus;
+        try
+        {
+            protectStatus = DirectSyscalls.NtProtectVirtualMemory(hProcess, ref baseAddr, ref region,
+                NativeConstants.PAGE_READWRITE, out oldProtect);
+        }
+        catch (Exception ex)
+        {
+            error = "could not make headers writable: " + ex.Message;
             return false;
+        }
 
-        var ok = DirectSyscalls.NtWriteVirtualMemory(hProcess, moduleBase, new byte[size], out var written) == 0 &&
-                 written.ToUInt64() == (ulong)size;
+        if (protectStatus != 0)
+        {
+            error = $"could not make headers writable (NTSTATUS 0x{protectStatus:X8})";
+            return false;
+        }
 
-        var restoreBase = moduleBase;
-        var restoreRegion = (UIntPtr)size;
-        DirectSyscalls.NtProtectVirtualMemory(hProcess, ref restoreBase, ref restoreRegion, oldProtect, out _);
-        return ok;
+        string? eraseFailure = null;
+        string? rollbackFailure = null;
+        string? protectionFailure = null;
+        try
+        {
+            var zeroStatus = DirectSyscalls.NtWriteVirtualMemory(hProcess, moduleBase, new byte[size], out var written);
+            if (zeroStatus != 0 || written.ToUInt64() != (ulong)size)
+            {
+                eraseFailure = $"header erase failed (NTSTATUS 0x{zeroStatus:X8}, wrote {written.ToUInt64()}/{size} bytes)";
+                rollbackFailure = TryRestoreHeaderBytes(hProcess, moduleBase, backup);
+            }
+            else
+            {
+                var zeroVerify = new byte[size];
+                var verifyStatus = DirectSyscalls.NtReadVirtualMemory(hProcess, moduleBase, zeroVerify, out var verified);
+                var hasNonzeroBytes = verifyStatus == 0 && verified.ToUInt64() == (ulong)size &&
+                                      zeroVerify.Any(value => value != 0);
+                if (verifyStatus != 0 || verified.ToUInt64() != (ulong)size || hasNonzeroBytes)
+                {
+                    var verificationResult = verifyStatus != 0 || verified.ToUInt64() != (ulong)size
+                        ? $"NTSTATUS 0x{verifyStatus:X8}, read {verified.ToUInt64()}/{size} bytes"
+                        : "readback contained nonzero bytes";
+                    eraseFailure = "zeroed header verification failed (" + verificationResult + ")";
+                    rollbackFailure = TryRestoreHeaderBytes(hProcess, moduleBase, backup);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            eraseFailure = "header erase or verification threw an exception: " + ex.Message;
+            rollbackFailure = TryRestoreHeaderBytes(hProcess, moduleBase, backup);
+        }
+        finally
+        {
+            try
+            {
+                var restoreBase = baseAddr;
+                var restoreRegion = region;
+                var restoreStatus = DirectSyscalls.NtProtectVirtualMemory(hProcess, ref restoreBase,
+                    ref restoreRegion, oldProtect, out _);
+                if (restoreStatus != 0)
+                    protectionFailure = $"restoring the original protection failed (NTSTATUS 0x{restoreStatus:X8})";
+            }
+            catch (Exception ex)
+            {
+                protectionFailure = "restoring the original protection threw an exception: " + ex.Message;
+            }
+        }
+
+        var failures = new List<string>();
+        if (eraseFailure is not null)
+        {
+            failures.Add(eraseFailure);
+            failures.Add(rollbackFailure is null
+                ? "original header bytes were restored and verified"
+                : "rollback failed: " + rollbackFailure);
+        }
+
+        if (protectionFailure is not null)
+            failures.Add(eraseFailure is null
+                ? "header erase completed, but " + protectionFailure
+                : protectionFailure);
+
+        if (failures.Count == 0)
+        {
+            error = string.Empty;
+            return true;
+        }
+
+        error = string.Join("; ", failures);
+        return false;
+    }
+
+    private static string? TryRestoreHeaderBytes(IntPtr hProcess, IntPtr moduleBase, byte[] backup)
+    {
+        try
+        {
+            var writeStatus = DirectSyscalls.NtWriteVirtualMemory(hProcess, moduleBase, backup, out var written);
+            if (writeStatus != 0 || written.ToUInt64() != (ulong)backup.Length)
+                return $"backup write failed (NTSTATUS 0x{writeStatus:X8}, wrote {written.ToUInt64()}/{backup.Length} bytes)";
+
+            var verify = new byte[backup.Length];
+            var readStatus = DirectSyscalls.NtReadVirtualMemory(hProcess, moduleBase, verify, out var read);
+            if (readStatus != 0 || read.ToUInt64() != (ulong)backup.Length)
+                return $"backup verification read failed (NTSTATUS 0x{readStatus:X8}, read {read.ToUInt64()}/{backup.Length} bytes)";
+
+            return backup.AsSpan().SequenceEqual(verify)
+                ? null
+                : "backup verification found mismatched bytes";
+        }
+        catch (Exception ex)
+        {
+            return "backup restoration or verification threw an exception: " + ex.Message;
+        }
     }
 }

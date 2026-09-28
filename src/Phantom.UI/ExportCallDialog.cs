@@ -113,5 +113,7 @@ public sealed class ExportCallDialog : Form
         _result.Text = outcome.Success
             ? $"OK. Address: 0x{outcome.FunctionAddress.ToInt64():X}{Environment.NewLine}Return value: 0x{outcome.ReturnValue:X} ({outcome.ReturnValue})"
             : "Failed: " + outcome.Error;
+        if (outcome.Warning is not null)
+            _result.Text += Environment.NewLine + "Warning: " + outcome.Warning;
     }
 }
