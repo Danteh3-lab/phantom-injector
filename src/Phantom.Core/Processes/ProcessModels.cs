@@ -7,6 +7,7 @@ public sealed class ProcessInfo
     public string? Path { get; init; }
     public string? WindowTitle { get; init; }
     public bool Is64Bit { get; init; } = true;
+    public long? CreationTime { get; init; }
 
     public override string ToString() => $"{Name} (PID {Pid})";
 }
@@ -33,6 +34,7 @@ public sealed class WindowInfo
 {
     public IntPtr Handle { get; init; }
     public uint Pid { get; init; }
+    public long? CreationTime { get; init; }
     public string Title { get; init; } = string.Empty;
     public string ClassName { get; init; } = string.Empty;
 

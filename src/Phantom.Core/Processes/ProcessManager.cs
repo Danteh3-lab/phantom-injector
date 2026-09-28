@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Runtime.InteropServices;
+using Phantom.Core.Injection;
 using Phantom.Core.Native;
 
 namespace Phantom.Core.Processes;
@@ -17,6 +18,7 @@ public static class ProcessManager
         {
             string? path = null;
             string? title = null;
+            long? creationTime = null;
             try
             {
                 path = p.MainModule?.FileName;
@@ -27,12 +29,16 @@ public static class ProcessManager
                 // Access denied for protected / other-session processes.
             }
 
+            try { creationTime = p.StartTime.ToUniversalTime().ToFileTimeUtc(); }
+            catch { /* An unreadable start time cannot be used as an identity. */ }
+
             results.Add(new ProcessInfo
             {
                 Pid = (uint)p.Id,
                 Name = p.ProcessName,
                 Path = path,
-                WindowTitle = title
+                WindowTitle = title,
+                CreationTime = creationTime
             });
 
             p.Dispose();
@@ -61,6 +67,7 @@ public static class ProcessManager
             {
                 string? path = null;
                 string? title = null;
+                long? creationTime = null;
                 try
                 {
                     path = process.MainModule?.FileName;
@@ -71,12 +78,16 @@ public static class ProcessManager
                     // Access denied for protected processes.
                 }
 
+                try { creationTime = process.StartTime.ToUniversalTime().ToFileTimeUtc(); }
+                catch { /* An unreadable start time cannot be used as an identity. */ }
+
                 return new ProcessInfo
                 {
                     Pid = (uint)process.Id,
                     Name = process.ProcessName,
                     Path = path,
                     WindowTitle = title,
+                    CreationTime = creationTime,
                     Is64Bit = IsAmd64Target((uint)process.Id)
                 };
             }
@@ -104,6 +115,7 @@ public static class ProcessManager
             Name = process.Name,
             Path = process.Path,
             WindowTitle = process.WindowTitle,
+            CreationTime = process.CreationTime,
             Is64Bit = IsAmd64Target(pid)
         };
     }
@@ -135,34 +147,43 @@ public static class ProcessManager
             hProcess == IntPtr.Zero)
             return ArchCheckResult.Unknown;
 
+        try { return CheckArchitecture(hProcess); }
+        finally { NativeMethods.CloseHandle(hProcess); }
+    }
+
+    /// <summary>Checks architecture on the retained, identity-verified handle
+    /// used by an injection operation.</summary>
+    internal static ArchCheckResult CheckArchitecture(TargetProcessIdentity target)
+    {
+        if (!target.MatchesHandle(target.Handle, requireRunning: true, out _))
+            return ArchCheckResult.Unknown;
+
+        return CheckArchitecture(target.Handle);
+    }
+
+    private static ArchCheckResult CheckArchitecture(IntPtr hProcess)
+    {
+        // Preferred: distinguish native vs WOW64 vs emulated targets and the
+        // host architecture explicitly (Windows 10 1709+). On older systems
+        // the export is absent and the call throws rather than returning false.
         try
         {
-            // Preferred: distinguish native vs WOW64 vs emulated targets and the
-            // host architecture explicitly (Windows 10 1709+). On older systems
-            // the export is absent and the call throws rather than returning false.
-            try
-            {
-                if (NativeMethods.IsWow64Process2(hProcess, out var processMachine, out var nativeMachine))
-                    return processMachine == 0 && nativeMachine == NativeConstants.IMAGE_FILE_MACHINE_AMD64
-                        ? ArchCheckResult.Amd64
-                        : ArchCheckResult.NotAmd64;
-            }
-            catch (EntryPointNotFoundException)
-            {
-                // Fall through to the legacy check.
-            }
-
-            // Fallback for older systems: the injector itself is AMD64, so a
-            // non-WOW64 target on such a system is an AMD64 process.
-            if (NativeMethods.IsWow64Process(hProcess, out var wow64))
-                return wow64 ? ArchCheckResult.NotAmd64 : ArchCheckResult.Amd64;
-
-            return ArchCheckResult.Unknown;
+            if (NativeMethods.IsWow64Process2(hProcess, out var processMachine, out var nativeMachine))
+                return processMachine == 0 && nativeMachine == NativeConstants.IMAGE_FILE_MACHINE_AMD64
+                    ? ArchCheckResult.Amd64
+                    : ArchCheckResult.NotAmd64;
         }
-        finally
+        catch (EntryPointNotFoundException)
         {
-            NativeMethods.CloseHandle(hProcess);
+            // Fall through to the legacy check.
         }
+
+        // Fallback for older systems: the injector itself is AMD64, so a
+        // non-WOW64 target on such a system is an AMD64 process.
+        if (NativeMethods.IsWow64Process(hProcess, out var wow64))
+            return wow64 ? ArchCheckResult.NotAmd64 : ArchCheckResult.Amd64;
+
+        return ArchCheckResult.Unknown;
     }
 
     public static ProcessInfo? GetByWindow(IntPtr hwnd)
@@ -174,8 +195,13 @@ public static class ProcessManager
     public static IReadOnlyList<ModuleInfo> GetModules(uint pid)
     {
         var modules = new List<ModuleInfo>();
-        using var hProcess = SafeNativeHandle.OpenProcess(pid,
-            NativeConstants.PROCESS_QUERY_INFORMATION | NativeConstants.PROCESS_VM_READ);
+        var access = NativeConstants.PROCESS_QUERY_INFORMATION | NativeConstants.PROCESS_VM_READ;
+        var target = TargetProcessIdentity.Current;
+        if (target is not null && target.Pid != pid)
+            throw new InvalidOperationException("The requested PID does not match the selected target process.");
+        using var hProcess = target is not null
+            ? new SafeNativeHandle(target.OpenVerifiedHandle(access))
+            : SafeNativeHandle.OpenProcess(pid, access);
 
         var needed = 0u;
         var handles = new IntPtr[1024];
@@ -211,6 +237,14 @@ public static class ProcessManager
 
     public static IReadOnlyList<ThreadInfo> GetThreads(uint pid)
     {
+        var target = TargetProcessIdentity.Current;
+        if (target is not null && target.Pid != pid)
+            throw new InvalidOperationException("The requested PID does not match the selected target process.");
+        string? identityError = null;
+        if (target is not null &&
+            !target.MatchesHandle(target.Handle, requireRunning: true, out identityError))
+            throw new InvalidOperationException(identityError ?? "The target process identity could not be verified.");
+
         var threads = new List<ThreadInfo>();
         var snapshot = NativeMethods.CreateToolhelp32Snapshot(NativeConstants.TH32CS_SNAPTHREAD, 0);
         if (snapshot == new IntPtr(-1))
@@ -238,6 +272,10 @@ public static class ProcessManager
         {
             NativeMethods.CloseHandle(snapshot);
         }
+
+        if (target is not null &&
+            !target.MatchesHandle(target.Handle, requireRunning: true, out identityError))
+            throw new InvalidOperationException(identityError ?? "The target process identity could not be verified.");
 
         return threads;
     }
@@ -267,6 +305,7 @@ public static class ProcessManager
             {
                 Handle = hwnd,
                 Pid = pid,
+                CreationTime = GetCreationTime(pid),
                 Title = text,
                 ClassName = cls.ToString()
             });
@@ -275,5 +314,18 @@ public static class ProcessManager
         }, IntPtr.Zero);
 
         return windows;
+    }
+
+    private static long? GetCreationTime(uint pid)
+    {
+        try
+        {
+            using var process = Process.GetProcessById((int)pid);
+            return process.StartTime.ToUniversalTime().ToFileTimeUtc();
+        }
+        catch
+        {
+            return null;
+        }
     }
 }

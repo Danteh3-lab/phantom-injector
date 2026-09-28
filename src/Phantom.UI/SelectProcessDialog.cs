@@ -14,6 +14,7 @@ public sealed class SelectProcessDialog : Form
 
     public uint SelectedPid { get; private set; }
     public string SelectedProcessName { get; private set; } = string.Empty;
+    public long? SelectedCreationTime { get; private set; }
 
     public SelectProcessDialog(bool dark)
     {
@@ -35,6 +36,15 @@ public sealed class SelectProcessDialog : Form
         _processList.Columns.Add("Window", 200);
         _processList.Columns.Add("Path", 240);
         _processList.DoubleClick += (_, _) => Accept(_processList);
+        _processList.ItemSelectionChanged += (_, e) =>
+        {
+            if (e.IsSelected && e.Item?.Tag is ProcessInfo process)
+            {
+                SelectedPid = process.Pid;
+                SelectedProcessName = process.Name + ".exe";
+                SelectedCreationTime = process.CreationTime;
+            }
+        };
 
         var processTab = new TabPage("Processes");
         var filterPanel = new Panel { Dock = DockStyle.Top, Height = 30 };
@@ -184,6 +194,7 @@ public sealed class SelectProcessDialog : Form
         {
             SelectedPid = p.Pid;
             SelectedProcessName = p.Name + ".exe";
+            SelectedCreationTime = p.CreationTime;
             DialogResult = DialogResult.OK;
             Close();
         }
@@ -193,7 +204,6 @@ public sealed class SelectProcessDialog : Form
     {
         if (_threadList.SelectedItems.Count > 0 && SelectedPid != 0)
         {
-            SelectedProcessName = ProcessManager.GetByPid(SelectedPid)?.Name + ".exe";
             DialogResult = DialogResult.OK;
             Close();
         }
@@ -205,6 +215,7 @@ public sealed class SelectProcessDialog : Form
         {
             SelectedPid = w.Pid;
             SelectedProcessName = ProcessManager.GetByPid(w.Pid)?.Name + ".exe" ?? string.Empty;
+            SelectedCreationTime = w.CreationTime;
             DialogResult = DialogResult.OK;
             Close();
         }

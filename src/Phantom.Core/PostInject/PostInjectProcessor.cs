@@ -14,7 +14,8 @@ public static class PostInjectProcessor
         NativeConstants.PROCESS_VM_OPERATION |
         NativeConstants.PROCESS_VM_READ |
         NativeConstants.PROCESS_VM_WRITE |
-        NativeConstants.PROCESS_CREATE_THREAD;
+        NativeConstants.PROCESS_CREATE_THREAD |
+        NativeConstants.SYNCHRONIZE;
 
     /// <summary>
     /// Runs the requested post-injection steps. Returns <c>null</c> when every
@@ -25,12 +26,39 @@ public static class PostInjectProcessor
         if (moduleBase == IntPtr.Zero)
             return "post-inject skipped: module base unknown.";
 
+        var preflight = TargetPreflight.Check(pid, Access);
+        if (preflight.ProbeError is not null)
+            return "post-inject failed: " + preflight.ProbeError;
+        if (!preflight.Opened)
+            return $"post-inject failed: NtOpenProcess - {NtStatus.Describe(preflight.OpenStatus)}";
+        if (!preflight.RightsQueried)
+            return $"post-inject failed: handle rights could not be verified ({NtStatus.Describe(preflight.QueryStatus)}).";
+        if (preflight.Missing.Length > 0)
+            return $"post-inject failed: required process rights are missing ({string.Join(", ", preflight.Missing)}).";
+
+        using var target = preflight.Target;
+        if (target is null)
+            return "post-inject failed: target process identity could not be retained.";
+
+        using var targetScope = target.EnterScope();
+        return Apply(target, moduleBase, options);
+    }
+
+    internal static string? Apply(TargetProcessIdentity target, IntPtr moduleBase, InjectionOptions options)
+    {
+        if (moduleBase == IntPtr.Zero)
+            return "post-inject skipped: module base unknown.";
+
         IntPtr hProcess;
         {
-            var openStatus = DirectSyscalls.NtOpenProcessByPid(out var opened, Access, pid);
-            if (openStatus != 0 || opened == IntPtr.Zero)
-                return $"post-inject failed: NtOpenProcess - 0x{openStatus:X8}";
-            hProcess = opened;
+            try
+            {
+                hProcess = target.OpenVerifiedHandle(Access);
+            }
+            catch (Exception ex)
+            {
+                return "post-inject failed: " + ex.Message;
+            }
         }
 
         try
@@ -46,7 +74,7 @@ public static class PostInjectProcessor
                 // top-level error; convert any failure into a warning.
                 try
                 {
-                    if (!LoaderLockUnlink.TryUnlink(pid, hProcess, moduleBase, out var hideError, out var hashNote))
+                    if (!LoaderLockUnlink.TryUnlink(target.Pid, hProcess, moduleBase, out var hideError, out var hashNote))
                     {
                         failures.Add("hide module (" + (hideError ?? "failed") + ")");
                     }

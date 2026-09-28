@@ -9,6 +9,10 @@ namespace Phantom.Core.Injection;
 public static class Injector
 {
     public static InjectionResult Inject(uint pid, string dllPath, InjectionOptions options)
+        => Inject(pid, dllPath, options, expectedCreationTime: null);
+
+    public static InjectionResult Inject(uint pid, string dllPath, InjectionOptions options,
+        long? expectedCreationTime)
     {
         if (!File.Exists(dllPath))
             return InjectionResult.Fail(options.Method, dllPath, "DLL file does not exist.");
@@ -20,7 +24,7 @@ public static class Injector
         // Access probe FIRST: the architecture query cannot distinguish a
         // denied open from a non-AMD64 target, so an access failure must be
         // reported as such instead of hiding behind "not AMD64".
-        var preflight = TargetPreflight.Check(pid, RequiredAccess(options.Method));
+        var preflight = TargetPreflight.Check(pid, RequiredAccess(options.Method), expectedCreationTime);
         if (preflight.ProbeError is not null)
             return InjectionResult.Fail(options.Method, dllPath,
                 "Preflight probe failed: " + preflight.ProbeError);
@@ -38,7 +42,14 @@ public static class Injector
                 $"(missing: {string.Join(", ", preflight.Missing)}; granted: 0x{preflight.Granted:X8}). " +
                 $"{options.Method} cannot proceed without them; check driver callbacks.");
 
-        switch (ProcessManager.CheckArchitecture(pid))
+        using var target = preflight.Target;
+        if (target is null)
+            return InjectionResult.Fail(options.Method, dllPath,
+                "Preflight: target process identity could not be retained. Failing closed.");
+
+        using var targetScope = target.EnterScope();
+
+        switch (ProcessManager.CheckArchitecture(target))
         {
             case ProcessManager.ArchCheckResult.NotAmd64:
                 return InjectionResult.Fail(options.Method, dllPath,
@@ -61,7 +72,7 @@ public static class Injector
             _ => new StandardInjector()
         };
 
-        return RunInjector(injector, pid, dllPath, options);
+        return RunInjector(injector, target, dllPath, options);
     }
 
     /// <summary>
@@ -77,10 +88,11 @@ public static class Injector
         _ => InjectorBase.InjectionAccess,
     };
 
-    private static InjectionResult RunInjector(IInjector injector, uint pid, string dllPath, InjectionOptions options)
+    private static InjectionResult RunInjector(IInjector injector, TargetProcessIdentity target,
+        string dllPath, InjectionOptions options)
     {
 
-        var result = injector.Inject(pid, dllPath, options);
+        var result = injector.Inject(target.Pid, dllPath, options);
 
         // Defense in depth (finding 8): never run PE erasure or PEB unlinking
         // against a non-image base. A DllMain boolean (0/1) must never reach here,
@@ -91,7 +103,7 @@ public static class Injector
 
         if (result.Success && (options.ErasePeHeaders || options.HideModule))
         {
-            var postError = PostInject.PostInjectProcessor.Apply(pid, result.ModuleBase, options);
+            var postError = PostInject.PostInjectProcessor.Apply(target, result.ModuleBase, options);
             if (postError is not null)
                 result.Warning = result.Warning is null ? postError : result.Warning + " " + postError;
         }

@@ -826,9 +826,10 @@ internal sealed unsafe class ModuleStompingInjector : InjectorBase
     /// <paramref name="excludeTid"/> and keeps one owned suspend count on each
     /// (including already-suspended ones, so no other owner can resume them
     /// mid-overwrite). Any unverified failure aborts before any overwrite;
-    /// the host is untouched in that case. Only ERROR_INVALID_PARAMETER
-    /// (unknown TID: raced exit) is treated as exited; every other open or
-    /// suspend failure aborts.
+    /// the host is untouched in that case. Open or identity failures are
+    /// checked against a fresh snapshot; only a TID no longer listed is treated
+    /// as a raced exit. Listed or unverifiable threads and suspend failures
+    /// abort the sweep.
     /// </summary>
     private static bool SuspendOtherThreads(uint pid, uint excludeTid, List<IntPtr> suspended, out string? error)
     {
@@ -848,17 +849,14 @@ internal sealed unsafe class ModuleStompingInjector : InjectorBase
         {
             if (tid == excludeTid)
                 continue;
-            // Direct open has no Win32 last-error worth reading: verify a
-            // failure against a fresh snapshot instead. Gone TID = raced
-            // exit (skip); live TID = denial, abort fail-closed.
-            var openStatus = DirectSyscalls.NtOpenThreadByTid(out var h, ThreadAccess, tid);
-            if (openStatus != 0 || h == IntPtr.Zero)
+            // Verify the thread owner before suspension, then distinguish a
+            // raced exit from an unverified live thread using a fresh snapshot.
+            var h = OpenRemoteThread(tid, ThreadAccess);
+            if (h == IntPtr.Zero)
             {
-                if (h != IntPtr.Zero)
-                    NativeMethods.CloseHandle(h);
                 if (!ThreadListed(pid, tid))
                     continue;
-                error = $"Could not open target thread {tid} (0x{openStatus:X8}); refusing to stomp.";
+                error = $"Could not open and verify target thread {tid}; refusing to stomp.";
                 AbortSweep(suspended, ref error);
                 return false;
             }

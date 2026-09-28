@@ -28,6 +28,7 @@ public sealed class MainForm : Form
     // The exact process chosen in the picker, so a same-name instance is never
     // silently substituted. Cleared when the process text is edited.
     private uint? _targetPid;
+    private long? _targetCreationTime;
 
     // Authoritative module base per (target PID, canonical DLL path), so export
     // calls work for manual-mapped and PEB-hidden modules and never reuse a base
@@ -123,7 +124,11 @@ public sealed class MainForm : Form
         _txtProcess.Width = 220;
         _txtProcess.PlaceholderText = "e.g. notepad.exe";
         // Editing the name invalidates an explicit picker selection.
-        _txtProcess.TextChanged += (_, _) => _targetPid = null;
+        _txtProcess.TextChanged += (_, _) =>
+        {
+            _targetPid = null;
+            _targetCreationTime = null;
+        };
         processRow.Controls.Add(_txtProcess);
 
         var btnSelect = new Button { Text = "Select...", Width = 90 };
@@ -317,9 +322,18 @@ public sealed class MainForm : Form
         if (dialog.ShowDialog(this) != DialogResult.OK || dialog.SelectedProcessName.Length == 0)
             return;
 
+        if (dialog.SelectedCreationTime is not long creationTime)
+        {
+            _targetPid = null;
+            _targetCreationTime = null;
+            Log("Could not record the selected process start time, so the PID was not locked.");
+            return;
+        }
+
         // Set the text first (which clears the PID), then record the exact PID.
         _txtProcess.Text = dialog.SelectedProcessName;
         _targetPid = dialog.SelectedPid;
+        _targetCreationTime = creationTime;
         Log($"Target locked to PID {dialog.SelectedPid}.");
     }
 
@@ -386,6 +400,7 @@ public sealed class MainForm : Form
     {
         public string ProcessName { get; init; } = string.Empty;
         public uint Pid { get; init; }
+        public long? ExpectedCreationTime { get; init; }
         public InjectionMethod Method { get; init; }
         public ScramblePreset Scramble { get; init; }
         public bool ErasePe { get; init; }
@@ -401,6 +416,7 @@ public sealed class MainForm : Form
         {
             ProcessName = _txtProcess.Text.Trim(),
             Pid = pid != 0 ? pid : (_targetPid ?? 0),
+            ExpectedCreationTime = pid != 0 ? null : _targetCreationTime,
             Method = _settings.Method,
             Scramble = _settings.Scramble,
             ErasePe = _settings.ErasePe,
@@ -457,10 +473,22 @@ public sealed class MainForm : Form
 
         Log($"Injecting {enabled.Count} DLL(s) into {process.Name} (PID {process.Pid}) using {job.Method}...");
 
-        // Capture the identity before opening the target for injection. If the
-        // PID is reused while the operation is in flight, never associate the
-        // returned base with the replacement process.
-        var targetStartTime = GetProcessStartTime(process.Pid);
+        var expectedCreationTime = job.ExpectedCreationTime ?? process.CreationTime;
+        if (expectedCreationTime is not long expected)
+        {
+            Log($"Could not verify the start time for PID {process.Pid}; injection was stopped.");
+            return;
+        }
+
+        if (job.ExpectedCreationTime is long selected && process.CreationTime != selected)
+        {
+            Log($"PID {process.Pid} no longer refers to the process instance selected in the picker.");
+            return;
+        }
+
+        // Keep the selected creation time as the expected identity for every
+        // DLL in this batch. Injector reopens must match this exact timestamp.
+        var targetStartTime = DateTime.FromFileTimeUtc(expected).ToLocalTime();
         var succeeded = 0;
         foreach (var (dllPath, _) in enabled)
         {
@@ -482,7 +510,7 @@ public sealed class MainForm : Form
                     HideModule = job.HideModule
                 };
 
-                var result = Injector.Inject(process.Pid, toInject, options);
+                var result = Injector.Inject(process.Pid, toInject, options, expected);
                 if (result.Success)
                 {
                     succeeded++;
@@ -553,6 +581,7 @@ public sealed class MainForm : Form
                 // Make the auto-found instance the active target so later export
                 // calls resolve against this exact process.
                 _targetPid = pid;
+                _targetCreationTime = null;
                 _ = InjectAllAsync(pid);
             }));
         };

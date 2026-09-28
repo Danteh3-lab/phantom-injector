@@ -19,9 +19,10 @@ internal static class TargetPreflight
         string[] Missing,
         bool RightsQueried,
         int QueryStatus,
-        string? ProbeError);
+        string? ProbeError,
+        TargetProcessIdentity? Target = null);
 
-    public static Result Check(uint pid, uint requestedAccess)
+    public static Result Check(uint pid, uint requestedAccess, long? expectedCreationTime = null)
     {
         IntPtr hProcess = IntPtr.Zero;
         try
@@ -30,15 +31,35 @@ internal static class TargetPreflight
             if (openStatus != 0 || hProcess == IntPtr.Zero)
                 return new Result(false, openStatus, requestedAccess, 0, Array.Empty<string>(), false, 0, null);
 
-            // A failed rights query is NOT stripped rights: report it as
-            // unverified with its own NTSTATUS instead of crediting the
-            // target's protection with a defense win.
+            // Preserve the original classification precedence: query granted
+            // rights before calling APIs that themselves need query/sync rights.
             var queryStatus = DirectSyscalls.NtQueryGrantedAccess(hProcess, out var granted);
+            // A failed rights query remains an unverified-rights result rather
+            // than being misreported as a process-identity failure.
             if (queryStatus != 0)
                 return new Result(true, 0, requestedAccess, 0, Array.Empty<string>(), false, queryStatus, null);
 
-            return new Result(true, 0, requestedAccess, granted,
-                RightsNames(requestedAccess & ~granted), true, 0, null);
+            var missing = RightsNames(requestedAccess & ~granted);
+            if (missing.Length > 0)
+                return new Result(true, 0, requestedAccess, granted, missing, true, 0, null);
+
+            if (NativeMethods.GetProcessId(hProcess) != pid ||
+                !NativeMethods.GetProcessTimes(hProcess, out var creationTime, out _, out _, out _))
+                return new Result(false, 0, requestedAccess, 0, Array.Empty<string>(), false, 0,
+                    "The target process identity could not be verified.");
+
+            var creationFileTime = creationTime.ToInt64();
+            if (NativeMethods.WaitForSingleObject(hProcess, 0) != NativeConstants.WAIT_TIMEOUT)
+                return new Result(false, 0, requestedAccess, 0, Array.Empty<string>(), false, 0,
+                    "The target process exited or its liveness could not be verified before preflight completed.");
+
+            if (expectedCreationTime is long expected && creationFileTime != expected)
+                return new Result(false, 0, requestedAccess, 0, Array.Empty<string>(), false, 0,
+                    $"PID {pid} no longer refers to the process instance selected in the UI.");
+
+            var target = TargetProcessIdentity.TakeOwnership(pid, hProcess, creationFileTime);
+            hProcess = IntPtr.Zero;
+            return new Result(true, 0, requestedAccess, granted, missing, true, 0, null, target);
         }
         catch (Exception ex)
         {
@@ -74,11 +95,12 @@ internal static class TargetPreflight
         Add(NativeConstants.PROCESS_VM_READ, nameof(NativeConstants.PROCESS_VM_READ));
         Add(NativeConstants.PROCESS_VM_WRITE, nameof(NativeConstants.PROCESS_VM_WRITE));
         Add(NativeConstants.PROCESS_SUSPEND_RESUME, nameof(NativeConstants.PROCESS_SUSPEND_RESUME));
+        Add(NativeConstants.SYNCHRONIZE, nameof(NativeConstants.SYNCHRONIZE));
 
         var known = NativeConstants.PROCESS_CREATE_THREAD | NativeConstants.PROCESS_QUERY_INFORMATION |
                     NativeConstants.PROCESS_QUERY_LIMITED_INFORMATION | NativeConstants.PROCESS_VM_OPERATION |
                     NativeConstants.PROCESS_VM_READ | NativeConstants.PROCESS_VM_WRITE |
-                    NativeConstants.PROCESS_SUSPEND_RESUME;
+                    NativeConstants.PROCESS_SUSPEND_RESUME | NativeConstants.SYNCHRONIZE;
         var unknown = mask & ~known;
         if (unknown != 0)
             names.Add($"0x{unknown:X8}");

@@ -15,6 +15,7 @@ internal static class NativeConstants
     public const uint PROCESS_VM_READ = 0x0010;
     public const uint PROCESS_VM_WRITE = 0x0020;
     public const uint PROCESS_SUSPEND_RESUME = 0x0800;
+    public const uint SYNCHRONIZE = 0x00100000;
 
     public const uint MEM_COMMIT = 0x00001000;
     public const uint MEM_RESERVE = 0x00002000;
@@ -88,6 +89,15 @@ internal static class NativeConstants
     public const uint TOKEN_ADJUST_PRIVILEGES = 0x0020;
     public const uint TOKEN_QUERY = 0x0008;
     public const uint SE_PRIVILEGE_ENABLED = 0x00000002;
+}
+
+[StructLayout(LayoutKind.Sequential)]
+internal struct NativeFileTime
+{
+    public uint LowDateTime;
+    public uint HighDateTime;
+
+    public readonly long ToInt64() => ((long)HighDateTime << 32) | LowDateTime;
 }
 
 [StructLayout(LayoutKind.Sequential)]
@@ -256,6 +266,17 @@ internal struct LIST_ENTRY
 
 internal static class NativeMethods
 {
+    [DllImport("kernel32.dll", SetLastError = true)]
+    internal static extern uint GetProcessId(IntPtr process);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    internal static extern bool GetProcessTimes(IntPtr process, out NativeFileTime creationTime,
+        out NativeFileTime exitTime, out NativeFileTime kernelTime, out NativeFileTime userTime);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    internal static extern uint GetProcessIdOfThread(IntPtr thread);
+
     [DllImport("kernel32.dll", SetLastError = true)]
     internal static extern IntPtr OpenProcess(uint dwDesiredAccess, [MarshalAs(UnmanagedType.Bool)] bool bInheritHandle, uint dwProcessId);
 

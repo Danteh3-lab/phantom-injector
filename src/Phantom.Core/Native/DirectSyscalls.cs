@@ -193,7 +193,7 @@ internal static class DirectSyscalls
 
         var funcTableOff = RvaToOffset(addressOfFunctions);
         var nameTableOff = RvaToOffset(addressOfNames);
-        var ordTableOff = RvaToOffset(addressOfNameOrdinals);
+        var ordTableOff = RvaToOffset(addressOfOrdinals);
         if (funcTableOff < 0 || nameTableOff < 0 || ordTableOff < 0)
             throw new InvalidOperationException("Clean ntdll export tables are out of range.");
 

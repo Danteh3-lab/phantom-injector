@@ -19,7 +19,8 @@ internal abstract class InjectorBase : IInjector
         NativeConstants.PROCESS_QUERY_INFORMATION |
         NativeConstants.PROCESS_VM_OPERATION |
         NativeConstants.PROCESS_VM_WRITE |
-        NativeConstants.PROCESS_VM_READ;
+        NativeConstants.PROCESS_VM_READ |
+        NativeConstants.SYNCHRONIZE;
 
     /// <summary>
     /// Open mask for the pure-hijack core path, which never creates a remote
@@ -31,13 +32,22 @@ internal abstract class InjectorBase : IInjector
         NativeConstants.PROCESS_QUERY_INFORMATION |
         NativeConstants.PROCESS_VM_OPERATION |
         NativeConstants.PROCESS_VM_WRITE |
-        NativeConstants.PROCESS_VM_READ;
+        NativeConstants.PROCESS_VM_READ |
+        NativeConstants.SYNCHRONIZE;
 
     /// <summary>
     /// Opens a target process handle via direct syscall (no usermode hooks).
     /// </summary>
     protected static IntPtr OpenRemoteProcess(uint pid, uint access)
     {
+        var target = TargetProcessIdentity.Current;
+        if (target is not null)
+        {
+            if (target.Pid != pid)
+                throw new InvalidOperationException("The requested PID does not match the selected target process.");
+            return target.OpenVerifiedHandle(access);
+        }
+
         var status = DirectSyscalls.NtOpenProcessByPid(out var hProcess, access, pid);
         if (status != 0 || hProcess == IntPtr.Zero)
             throw new InvalidOperationException($"NtOpenProcess failed: {NtStatus.Describe(status)}");
@@ -53,6 +63,14 @@ internal abstract class InjectorBase : IInjector
         var status = DirectSyscalls.NtOpenThreadByTid(out var hThread, access, tid);
         if (status != 0 || hThread == IntPtr.Zero)
             return IntPtr.Zero;
+
+        var target = TargetProcessIdentity.Current;
+        if (target is not null && !target.MatchesThread(hThread))
+        {
+            NativeMethods.CloseHandle(hThread);
+            return IntPtr.Zero;
+        }
+
         return hThread;
     }
 
