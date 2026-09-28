@@ -96,6 +96,28 @@ internal static class DirectSyscalls
         public IntPtr UniqueThread;
     }
 
+    [StructLayout(LayoutKind.Sequential)]
+    private struct NativeObjectAttributes
+    {
+        public uint Length;
+        public IntPtr RootDirectory;
+        public IntPtr ObjectName;
+        public uint Attributes;
+        public IntPtr SecurityDescriptor;
+        public IntPtr SecurityQualityOfService;
+    }
+
+    private static IntPtr AllocateEmptyObjectAttributes()
+    {
+        var attributes = new NativeObjectAttributes
+        {
+            Length = (uint)Marshal.SizeOf<NativeObjectAttributes>()
+        };
+        var ptr = Marshal.AllocHGlobal(Marshal.SizeOf<NativeObjectAttributes>());
+        Marshal.StructureToPtr(attributes, ptr, false);
+        return ptr;
+    }
+
     public static void Initialize()
     {
         if (Initialized)
@@ -492,14 +514,18 @@ internal static class DirectSyscalls
         var stub = GetSyscallStub("NtOpenProcess");
         var del = Marshal.GetDelegateForFunctionPointer<NtOpenProcessDelegate>(stub);
         var cidPtr = Marshal.AllocHGlobal(Marshal.SizeOf<NativeClientId>());
+        var objectAttributesPtr = IntPtr.Zero;
         try
         {
+            objectAttributesPtr = AllocateEmptyObjectAttributes();
             Marshal.StructureToPtr(new NativeClientId { UniqueProcess = new IntPtr(pid), UniqueThread = IntPtr.Zero }, cidPtr, false);
-            return del(out processHandle, desiredAccess, IntPtr.Zero, cidPtr);
+            return del(out processHandle, desiredAccess, objectAttributesPtr, cidPtr);
         }
         finally
         {
             Marshal.FreeHGlobal(cidPtr);
+            if (objectAttributesPtr != IntPtr.Zero)
+                Marshal.FreeHGlobal(objectAttributesPtr);
         }
     }
 
@@ -508,14 +534,18 @@ internal static class DirectSyscalls
         var stub = GetSyscallStub("NtOpenThread");
         var del = Marshal.GetDelegateForFunctionPointer<NtOpenThreadDelegate>(stub);
         var cidPtr = Marshal.AllocHGlobal(Marshal.SizeOf<NativeClientId>());
+        var objectAttributesPtr = IntPtr.Zero;
         try
         {
+            objectAttributesPtr = AllocateEmptyObjectAttributes();
             Marshal.StructureToPtr(new NativeClientId { UniqueProcess = IntPtr.Zero, UniqueThread = new IntPtr(tid) }, cidPtr, false);
-            return del(out threadHandle, desiredAccess, IntPtr.Zero, cidPtr);
+            return del(out threadHandle, desiredAccess, objectAttributesPtr, cidPtr);
         }
         finally
         {
             Marshal.FreeHGlobal(cidPtr);
+            if (objectAttributesPtr != IntPtr.Zero)
+                Marshal.FreeHGlobal(objectAttributesPtr);
         }
     }
 
