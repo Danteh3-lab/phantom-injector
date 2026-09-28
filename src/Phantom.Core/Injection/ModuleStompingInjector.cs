@@ -38,6 +38,7 @@ internal sealed unsafe class ModuleStompingInjector : InjectorBase
     private const int MinimumStackMargin = 0x8000;
     private const int TebStackLimitOffset = 0x10;
     private const int TebLastErrorOffset = 0x68;
+    private const uint ImageScnMemExecute = 0x20000000;
 
     public override InjectionResult Inject(uint pid, string dllPath, InjectionOptions options)
     {
@@ -65,13 +66,14 @@ internal sealed unsafe class ModuleStompingInjector : InjectorBase
                 return InjectionResult.Fail(Method, dllPath, "OpenProcess failed: " + ex.Message);
             }
 
-            var stompTarget = FindStompTarget(hProcess, pe);
+            var stompTarget = FindStompTarget(hProcess, pe, out var targetFailure);
             var stompBase = stompTarget.BaseAddress;
             var stompPe = stompTarget.PeInfo;
             if (stompBase == IntPtr.Zero || stompPe is null)
             {
                 NativeMethods.CloseHandle(hProcess);
-                return InjectionResult.Fail(Method, dllPath, "Could not find a suitable module to stomp (need SizeOfImage and .text capacity >= payload).");
+                return InjectionResult.Fail(Method, dllPath, targetFailure ??
+                    "Could not find a suitable module to stomp (need SizeOfImage and executable-section capacity >= payload).");
             }
 
             var threads = ProcessManager.GetThreads(pid).OrderBy(t => t.ThreadId).ToList();
@@ -123,15 +125,28 @@ internal sealed unsafe class ModuleStompingInjector : InjectorBase
         }
     }
 
-    private static (IntPtr BaseAddress, PeImage? PeInfo, string ModuleName) FindStompTarget(IntPtr hProcess, PeImage payload)
+    private static (IntPtr BaseAddress, PeImage? PeInfo, string ModuleName) FindStompTarget(
+        IntPtr hProcess, PeImage payload, out string? failure)
     {
-        var payloadTextSize = PayloadTextSize(payload);
+        failure = null;
+        var payloadExecutableCapacity = ExecutableSectionCapacity(payload);
+        if (payloadExecutableCapacity is null)
+        {
+            failure = "Payload has no executable section with nonzero capacity.";
+            return (IntPtr.Zero, null, string.Empty);
+        }
+
         var modules = new IntPtr[1024];
         if (!NativeMethods.EnumProcessModulesEx(hProcess, modules, (uint)(modules.Length * IntPtr.Size), out var needed, NativeConstants.LIST_MODULES_ALL))
+        {
+            failure = "Could not enumerate host modules to inspect executable-section capacity.";
             return (IntPtr.Zero, null, string.Empty);
+        }
 
         var count = needed / (uint)IntPtr.Size;
         var sb = new System.Text.StringBuilder(260);
+        var inspectedHosts = 0;
+        var hasExecutableHost = false;
 
         (IntPtr Base, PeImage? Pe, string Name, uint Size) best = (IntPtr.Zero, null, string.Empty, uint.MaxValue);
 
@@ -163,11 +178,12 @@ internal sealed unsafe class ModuleStompingInjector : InjectorBase
                 continue;
             }
 
-            var targetText = targetPe.Sections.FirstOrDefault(s => s.Name.StartsWith(".text", StringComparison.OrdinalIgnoreCase));
-            if (targetText is null)
+            inspectedHosts++;
+            var targetExecutableCapacity = ExecutableSectionCapacity(targetPe);
+            if (targetExecutableCapacity is null)
                 continue;
-            var targetTextSize = (long)Math.Max(targetText.VirtualSize, targetText.SizeOfRawData);
-            if (targetTextSize < payloadTextSize)
+            hasExecutableHost = true;
+            if (targetExecutableCapacity.Value < payloadExecutableCapacity.Value)
                 continue;
 
             // Prefer the smallest fitting host to reduce blast radius.
@@ -175,19 +191,26 @@ internal sealed unsafe class ModuleStompingInjector : InjectorBase
                 best = (info.lpBaseOfDll, targetPe, moduleName, info.SizeOfImage);
         }
 
+        if (best.Base == IntPtr.Zero)
+        {
+            failure = inspectedHosts > 0 && !hasExecutableHost
+                ? "No inspected host module has an executable section with nonzero capacity."
+                : "Could not find a suitable module to stomp (need SizeOfImage and executable-section capacity >= payload).";
+        }
+
         return (best.Base, best.Pe, best.Name);
     }
 
-    private static long PayloadTextSize(PeImage payload)
+    private static long? ExecutableSectionCapacity(PeImage image)
     {
         long max = 0;
-        foreach (var s in payload.Sections)
+        foreach (var section in image.Sections)
         {
-            if (s.Name.StartsWith(".text", StringComparison.OrdinalIgnoreCase))
-                max = Math.Max(max, (long)Math.Max(s.VirtualSize, s.SizeOfRawData));
+            if ((section.Characteristics & ImageScnMemExecute) != 0)
+                max = Math.Max(max, (long)Math.Max(section.VirtualSize, section.SizeOfRawData));
         }
-        // Fall back to whole image size when no .text (unusual for DLLs).
-        return max > 0 ? max : payload.SizeOfImage;
+
+        return max > 0 ? max : null;
     }
 
     private static bool IsCriticalModule(string moduleName)
