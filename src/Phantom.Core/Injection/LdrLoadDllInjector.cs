@@ -23,15 +23,21 @@ internal sealed class LdrLoadDllInjector : InjectorBase
         var remoteThread = default(RemoteThreadResult);
         try
         {
+            options.ReportProgress("ldr-open", "Open target process", InjectionProgressStatus.Running);
             try
             {
                 hProcess = OpenRemoteProcess(pid, InjectionAccess);
             }
             catch (Exception ex)
             {
+                options.ReportProgress("ldr-open", "Open target process", InjectionProgressStatus.Failed, ex.Message);
                 return InjectionResult.Fail(Method, dllPath, "OpenProcess failed: " + ex.Message);
             }
+            options.ReportProgress("ldr-open", "Open target process", InjectionProgressStatus.Succeeded,
+                "Verified target handle opened.");
 
+            options.ReportProgress("ldr-prepare", "Prepare LdrLoadDll call", InjectionProgressStatus.Running,
+                "Resolving the target loader and writing its arguments and stub.");
             var ldrLoadDll = ResolveRemoteExport(pid, "ntdll.dll", "LdrLoadDll");
 
             remotePath = WriteRemoteString(hProcess, dllPath, out var pathBytes);
@@ -51,29 +57,56 @@ internal sealed class LdrLoadDllInjector : InjectorBase
             remoteStub = AllocateRemote(hProcess, stub.Length, NativeConstants.PAGE_EXECUTE_READWRITE);
             WriteRemote(hProcess, remoteStub, stub);
             NativeMethods.FlushInstructionCacheChecked(hProcess, remoteStub, stub.Length);
+            options.ReportProgress("ldr-prepare", "Prepare LdrLoadDll call", InjectionProgressStatus.Succeeded,
+                "Loader arguments and executable stub are ready.");
 
+            options.ReportProgress("ldr-run", "Run LdrLoadDll in target", InjectionProgressStatus.Running);
             remoteThread = RunRemoteThread(hProcess, remoteStub, IntPtr.Zero, options.TimeoutMs);
 
             if (remoteThread.UnsafeToFree)
+            {
+                options.ReportProgress("ldr-run", "Run LdrLoadDll in target", InjectionProgressStatus.Failed,
+                    "Remote thread may still be running; its buffers were retained.");
                 return InjectionResult.Fail(Method, dllPath,
                     "Injection did not complete (timeout or wait failure); the remote thread may still be running so its buffers were left intact.");
+            }
 
             if (!remoteThread.Created)
+            {
+                options.ReportProgress("ldr-run", "Run LdrLoadDll in target", InjectionProgressStatus.Failed,
+                    NtStatus.Describe(remoteThread.Status), $"NTSTATUS 0x{remoteThread.Status:X8}");
                 return InjectionResult.Fail(Method, dllPath, $"NtCreateThreadEx failed in the target: {NtStatus.Describe(remoteThread.Status)}.");
+            }
 
             // NTSTATUS_SUCCESS == 0
             if (remoteThread.ExitCode != 0)
             {
+                options.ReportProgress("ldr-run", "Run LdrLoadDll in target", InjectionProgressStatus.Failed,
+                    $"LdrLoadDll returned NTSTATUS 0x{remoteThread.ExitCode:X8}.");
                 return InjectionResult.Fail(Method, dllPath,
                     $"LdrLoadDll returned NTSTATUS 0x{remoteThread.ExitCode:X8}. The target may restrict this call.", remoteThread.ExitCode);
             }
+            options.ReportProgress("ldr-run", "Run LdrLoadDll in target", InjectionProgressStatus.Succeeded,
+                "Remote loader thread completed successfully.", remoteThread.ThreadId == 0 ? null : $"Thread ID: {remoteThread.ThreadId}");
 
+            options.ReportProgress("ldr-handle", "Read loaded module handle", InjectionProgressStatus.Running);
             if (!TryReadRemoteInt64(hProcess, remoteHandle, out var handleValue))
+            {
+                options.ReportProgress("ldr-handle", "Read loaded module handle", InjectionProgressStatus.Failed,
+                    "LdrLoadDll succeeded but the module handle could not be read back.");
                 return InjectionResult.Fail(Method, dllPath, "LdrLoadDll returned success but the module handle could not be read back.");
+            }
 
             var moduleBase = new IntPtr(handleValue);
             if (moduleBase == IntPtr.Zero)
+            {
+                options.ReportProgress("ldr-handle", "Read loaded module handle", InjectionProgressStatus.Failed,
+                    "LdrLoadDll reported a null module handle.");
                 return InjectionResult.Fail(Method, dllPath, "LdrLoadDll returned success but reported a null module handle.");
+            }
+
+            options.ReportProgress("ldr-handle", "Read loaded module handle", InjectionProgressStatus.Succeeded,
+                $"Module base: 0x{moduleBase.ToInt64():X}");
 
             return InjectionResult.Ok(Method, dllPath, moduleBase, remoteThread.ThreadId);
         }
@@ -87,13 +120,36 @@ internal sealed class LdrLoadDllInjector : InjectorBase
             {
                 if (!remoteThread.UnsafeToFree)
                 {
-                    FreeRemote(hProcess, remoteStub);
-                    FreeRemote(hProcess, remoteHandle);
-                    FreeRemote(hProcess, remoteUnicodeString);
-                    FreeRemote(hProcess, remotePath);
+                    options.ReportProgress("ldr-cleanup", "Release temporary remote buffers", InjectionProgressStatus.Running);
+                    var cleanup = new[]
+                    {
+                        (Address: remoteStub, Result: FreeRemote(hProcess, remoteStub)),
+                        (Address: remoteHandle, Result: FreeRemote(hProcess, remoteHandle)),
+                        (Address: remoteUnicodeString, Result: FreeRemote(hProcess, remoteUnicodeString)),
+                        (Address: remotePath, Result: FreeRemote(hProcess, remotePath))
+                    };
+                    var failedCleanup = cleanup.Where(item => !item.Result.Succeeded).ToArray();
+                    options.ReportProgress("ldr-cleanup", "Release temporary remote buffers",
+                        failedCleanup.Length == 0 ? InjectionProgressStatus.Succeeded : InjectionProgressStatus.Warning,
+                        failedCleanup.Length == 0 ? "Temporary call buffers were released." : "One or more buffers remain queued for cleanup.",
+                        failedCleanup.Length == 0 ? null : string.Join(Environment.NewLine, failedCleanup.Select(item => item.Result.Describe(item.Address))));
                 }
+                else
+                    options.ReportProgress("ldr-cleanup", "Release temporary remote buffers", InjectionProgressStatus.Skipped,
+                        "Buffers remain mapped because the remote thread may still be running.");
 
-                NativeMethods.CloseHandle(hProcess);
+                options.ReportProgress("ldr-close", "Close target handle", InjectionProgressStatus.Running);
+                var closed = NativeMethods.CloseHandle(hProcess);
+                options.ReportProgress("ldr-close", "Close target handle",
+                    closed ? InjectionProgressStatus.Succeeded : InjectionProgressStatus.Warning,
+                    closed ? "Target handle closed." : "Target handle close reported an error.");
+            }
+            else
+            {
+                options.ReportProgress("ldr-cleanup", "Release temporary remote buffers", InjectionProgressStatus.Skipped,
+                    "No remote buffers were allocated.");
+                options.ReportProgress("ldr-close", "Close target handle", InjectionProgressStatus.Skipped,
+                    "No target handle was acquired.");
             }
         }
     }

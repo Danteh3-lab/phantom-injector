@@ -32,6 +32,7 @@ internal sealed unsafe class ThreadHijackInjector : InjectorBase
         IntPtr hProcess = IntPtr.Zero;
         try
         {
+            options.ReportProgress("hijack-open", "Open target process", InjectionProgressStatus.Running);
             try
             {
                 // Hijack core path creates no remote threads: open without
@@ -40,19 +41,35 @@ internal sealed unsafe class ThreadHijackInjector : InjectorBase
             }
             catch (Exception ex)
             {
+                options.ReportProgress("hijack-open", "Open target process", InjectionProgressStatus.Failed, ex.Message);
                 return InjectionResult.Fail(Method, dllPath, "OpenProcess failed: " + ex.Message);
             }
+            options.ReportProgress("hijack-open", "Open target process", InjectionProgressStatus.Succeeded,
+                "Verified target handle opened with thread-hijack rights.");
 
+            options.ReportProgress("hijack-enumerate", "Enumerate target threads", InjectionProgressStatus.Running);
             var candidates = ProcessManager.GetThreads(pid).OrderBy(t => t.ThreadId).ToList();
             if (candidates.Count == 0)
+            {
+                options.ReportProgress("hijack-enumerate", "Enumerate target threads", InjectionProgressStatus.Failed,
+                    "The target has no threads to hijack.");
                 return InjectionResult.Fail(Method, dllPath, "The target has no threads to hijack.");
+            }
+            options.ReportProgress("hijack-enumerate", "Enumerate target threads", InjectionProgressStatus.Succeeded,
+                $"Found {candidates.Count} thread candidate(s).");
 
+            options.ReportProgress("hijack-select", "Find a suitable thread", InjectionProgressStatus.Running,
+                "Checking candidate threads for a safe stack and restorable context.");
             foreach (var candidate in candidates)
             {
                 if (!TrySuspendCandidate(candidate.ThreadId, out var hThread, out var acquireError))
                 {
                     if (acquireError is not null)
+                    {
+                        options.ReportProgress("hijack-select", "Find a suitable thread", InjectionProgressStatus.Failed,
+                            acquireError);
                         return InjectionResult.Fail(Method, dllPath, acquireError);
+                    }
                     continue;
                 }
 
@@ -63,6 +80,8 @@ internal sealed unsafe class ThreadHijackInjector : InjectorBase
                     return outcome;
             }
 
+            options.ReportProgress("hijack-select", "Find a suitable thread", InjectionProgressStatus.Failed,
+                "No hijackable thread with a known, sufficiently large stack was found.");
             return InjectionResult.Fail(Method, dllPath,
                 "No hijackable thread with a known, sufficiently large stack was found.");
         }
@@ -73,7 +92,16 @@ internal sealed unsafe class ThreadHijackInjector : InjectorBase
         finally
         {
             if (hProcess != IntPtr.Zero)
-                NativeMethods.CloseHandle(hProcess);
+            {
+                options.ReportProgress("hijack-close", "Close target handle", InjectionProgressStatus.Running);
+                var closed = NativeMethods.CloseHandle(hProcess);
+                options.ReportProgress("hijack-close", "Close target handle",
+                    closed ? InjectionProgressStatus.Succeeded : InjectionProgressStatus.Warning,
+                    closed ? "Target handle closed." : "Target handle close reported an error.");
+            }
+            else
+                options.ReportProgress("hijack-close", "Close target handle", InjectionProgressStatus.Skipped,
+                    "No target handle was acquired.");
         }
     }
 
@@ -163,6 +191,8 @@ internal sealed unsafe class ThreadHijackInjector : InjectorBase
 
         try
         {
+            options.ReportProgress("hijack-context", "Capture and check thread context", InjectionProgressStatus.Running,
+                $"Inspecting thread {threadId} and its available stack margin.");
             contextBuffer = CreateExtendedContext(out var contextPtr);
             if (contextBuffer == IntPtr.Zero)
                 return InjectionResult.Fail(Method, dllPath,
@@ -180,15 +210,23 @@ internal sealed unsafe class ThreadHijackInjector : InjectorBase
             if (!TryGetTebInfo(hProcess, hThread, out var teb, out var stackLimit, out var lastError))
             {
                 // Unknown stack limit is treated as unsuitable (fail closed).
+                options.ReportProgress("hijack-context", "Capture and check thread context", InjectionProgressStatus.Skipped,
+                    $"Thread {threadId} stack information could not be verified.");
                 Release();
                 return null;
             }
 
             if (originalRsp <= stackLimit || originalRsp - stackLimit < MinimumStackMargin)
             {
+                options.ReportProgress("hijack-context", "Capture and check thread context", InjectionProgressStatus.Skipped,
+                    $"Thread {threadId} does not have enough verified stack margin.");
                 Release();
                 return null;
             }
+            options.ReportProgress("hijack-context", "Capture and check thread context", InjectionProgressStatus.Succeeded,
+                $"Thread {threadId} context and stack margin are usable.");
+            options.ReportProgress("hijack-select", "Find a suitable thread", InjectionProgressStatus.Succeeded,
+                $"Thread {threadId} has a restorable context and sufficient stack margin.");
 
             var pathBytes = Encoding.Unicode.GetBytes(dllPath + "\0");
             var resultOffset = Align(pathBytes.Length, 8);
@@ -209,8 +247,11 @@ internal sealed unsafe class ThreadHijackInjector : InjectorBase
             var loadLibrary = ResolveRemoteExport(pid, "kernel32.dll", "LoadLibraryW");
             var sleep = ResolveRemoteExport(pid, "kernel32.dll", "Sleep");
             var stub = BuildStub(loadLibrary, sleep, pathAddress, resultAddress, doneAddress);
+            options.ReportProgress("hijack-stub", "Prepare thread loader stub", InjectionProgressStatus.Running);
             WriteRemote(hProcess, stubAddress, stub);
             NativeMethods.FlushInstructionCacheChecked(hProcess, stubAddress, stub.Length);
+            options.ReportProgress("hijack-stub", "Prepare thread loader stub", InjectionProgressStatus.Succeeded,
+                "Loader stub and result slots are ready.");
 
             // NOTE: no spoofed stack. A fake stack placed adjacent to the stub
             // would grow downward into the stub/data slots on deep
@@ -226,6 +267,8 @@ internal sealed unsafe class ThreadHijackInjector : InjectorBase
             }
 
             redirected = true;
+            options.ReportProgress("hijack-run", "Wait for hijacked loader stub", InjectionProgressStatus.Running,
+                $"Redirecting thread {threadId}; its original context will be restored afterward.");
             if (!Release())
             {
                 // Never resume a redirected thread unless the original context is
@@ -241,10 +284,18 @@ internal sealed unsafe class ThreadHijackInjector : InjectorBase
             }
 
             if (!WaitForDone(hProcess, doneAddress, resultAddress, options.TimeoutMs, out var moduleBase, out var resultReadable))
+            {
+                options.ReportProgress("hijack-run", "Wait for hijacked loader stub", InjectionProgressStatus.Failed,
+                    "The hijacked thread did not finish; its stub was retained.");
                 return InjectionResult.Fail(Method, dllPath,
                     "The hijacked thread did not finish loading; its stub was left intact and the thread may still be running.");
+            }
+            options.ReportProgress("hijack-run", "Wait for hijacked loader stub", InjectionProgressStatus.Succeeded,
+                "The loader stub signaled completion; the result is checked separately.");
 
             // The stub is now parked: suspend, restore the original state, resume.
+            options.ReportProgress("hijack-restore", "Restore original thread state", InjectionProgressStatus.Running,
+                "Suspending the parked thread and restoring its saved context.");
             if (DirectSyscalls.NtSuspendThread(hThread, out _) != 0)
                 return InjectionResult.Fail(Method, dllPath,
                     "Could not re-suspend the hijacked thread to restore its state; it was left parked in the stub.");
@@ -271,22 +322,41 @@ internal sealed unsafe class ThreadHijackInjector : InjectorBase
             redirected = false;
             if (!Release())
                 return InjectionResult.Fail(Method, dllPath, "ResumeThread failed after restoring the thread context.");
+            options.ReportProgress("hijack-restore", "Restore original thread state", InjectionProgressStatus.Succeeded,
+                "The original context was restored and the thread resumed.");
 
             // The thread no longer executes the region, so it can be released.
-            FreeRemote(hProcess, region);
+            options.ReportProgress("hijack-region-cleanup", "Release hijack buffer", InjectionProgressStatus.Running);
+            var regionAddress = region;
+            var regionCleanup = FreeRemote(hProcess, regionAddress);
             region = IntPtr.Zero;
+            options.ReportProgress("hijack-region-cleanup", "Release hijack buffer",
+                regionCleanup.Succeeded ? InjectionProgressStatus.Succeeded : InjectionProgressStatus.Warning,
+                regionCleanup.Succeeded ? "The thread no longer uses the buffer." : "The buffer remains queued for cleanup.",
+                regionCleanup.Succeeded ? null : regionCleanup.Describe(regionAddress));
 
+            options.ReportProgress("hijack-result", "Verify loader result", InjectionProgressStatus.Running);
             if (!resultReadable)
+            {
+                options.ReportProgress("hijack-result", "Verify loader result", InjectionProgressStatus.Failed,
+                    "Thread was restored, but the recorded HMODULE could not be read.");
                 return InjectionResult.Fail(Method, dllPath,
                     "The thread was restored but its recorded HMODULE could not be read; the load outcome is unknown.");
+            }
 
             if (moduleBase == 0)
+            {
+                options.ReportProgress("hijack-result", "Verify loader result", InjectionProgressStatus.Failed,
+                    "LoadLibraryW returned a null module address.");
                 return InjectionResult.Fail(Method, dllPath, "LoadLibraryW returned NULL in the target.");
+            }
 
             // moduleBase is the full 64-bit HMODULE recorded by the stub and is
             // authoritative; a basename module-list match could return a
             // different module with the same filename.
             var baseAddress = new IntPtr(moduleBase);
+            options.ReportProgress("hijack-result", "Verify loader result", InjectionProgressStatus.Succeeded,
+                $"Module base: 0x{baseAddress.ToInt64():X}");
             var result = InjectionResult.Ok(Method, dllPath, baseAddress, threadId);
             if (!lastErrorRestored)
                 result.Warning = "The target TEB LastErrorValue could not be restored.";
@@ -307,8 +377,20 @@ internal sealed unsafe class ThreadHijackInjector : InjectorBase
             // be executing the region, so it is safe to free it.
             if (!redirected && region != IntPtr.Zero)
             {
-                FreeRemote(hProcess, region);
+                options.ReportProgress("hijack-region-cleanup", "Release hijack buffer", InjectionProgressStatus.Running,
+                    "Releasing the temporary stub after the thread is no longer redirected.");
+                var regionAddress = region;
+                var cleanup = FreeRemote(hProcess, regionAddress);
                 region = IntPtr.Zero;
+                options.ReportProgress("hijack-region-cleanup", "Release hijack buffer",
+                    cleanup.Succeeded ? InjectionProgressStatus.Succeeded : InjectionProgressStatus.Warning,
+                    cleanup.Succeeded ? "Temporary hijack buffer released." : "Buffer remains queued for cleanup.",
+                    cleanup.Succeeded ? null : cleanup.Describe(regionAddress));
+            }
+            else if (redirected && region != IntPtr.Zero)
+            {
+                options.ReportProgress("hijack-region-cleanup", "Release hijack buffer", InjectionProgressStatus.Skipped,
+                    "Buffer retained because the target thread may still execute it.");
             }
 
             if (contextBuffer != IntPtr.Zero)

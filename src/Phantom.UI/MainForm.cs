@@ -20,6 +20,17 @@ public sealed class MainForm : Form
     private readonly ListView _lvDlls = new();
     private readonly TextBox _log = new();
     private readonly Button _btnInject = new();
+    private readonly TabControl _outputTabs = new();
+    private readonly TreeView _progressTree = new();
+    private readonly Label _progressSummary = new();
+    private readonly Dictionary<(long Batch, string Path, string Stage), TreeNode> _progressNodes = new();
+    private readonly Dictionary<(long Batch, string Path), TreeNode> _progressDllNodes = new();
+    private readonly Dictionary<(long Batch, string Path), TreeNode> _progressRecoveryNodes = new();
+    private readonly Dictionary<TreeNode, List<(DateTimeOffset At, InjectionProgressEvent Event)>> _progressHistory = new();
+    private const int ProgressHistoryCapacity = 12;
+    private long _progressBatchId;
+    private InjectionMethod _progressMethod;
+    private string _progressTargetContext = "Target not resolved yet";
 
     private ProcessWatcher? _watcher;
     private bool _injecting;
@@ -37,6 +48,8 @@ public sealed class MainForm : Form
     private readonly Dictionary<(uint Pid, string Path), InjectedModule> _injected = new();
 
     private readonly record struct InjectedModule(IntPtr Base, bool HeadersErased, DateTime ProcessStartTime);
+
+    private sealed record ProgressStagePlan(string Id, string Name);
 
     private static (uint Pid, string Path) InjectedKey(uint pid, string dllPath)
         => (pid, Path.GetFullPath(dllPath).ToLowerInvariant());
@@ -99,7 +112,7 @@ public sealed class MainForm : Form
         };
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 84));
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 200));
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 240));
 
         root.Controls.Add(BuildTopPanel(), 0, 0);
         root.Controls.Add(BuildCenterPanel(), 0, 1);
@@ -285,7 +298,45 @@ public sealed class MainForm : Form
         _log.ScrollBars = ScrollBars.Vertical;
         _log.Font = new Font("Consolas", 9f);
 
-        bottom.Controls.Add(_log);
+        _outputTabs.Dock = DockStyle.Fill;
+        _outputTabs.Padding = new Point(12, 4);
+
+        var logPage = new TabPage("Log") { Padding = new Padding(4) };
+        logPage.Controls.Add(_log);
+
+        var progressPage = new TabPage("Progress") { Padding = new Padding(4) };
+        var progressLayout = new TableLayoutPanel
+        {
+            Dock = DockStyle.Fill,
+            ColumnCount = 1,
+            RowCount = 2,
+            Padding = new Padding(4)
+        };
+        progressLayout.RowStyles.Add(new RowStyle(SizeType.Absolute, 28));
+        progressLayout.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
+
+        _progressSummary.Dock = DockStyle.Fill;
+        _progressSummary.TextAlign = ContentAlignment.MiddleLeft;
+        _progressSummary.Text = "No injection has run.";
+        _progressSummary.Font = new Font("Segoe UI", 9f, FontStyle.Bold);
+
+        _progressTree.Dock = DockStyle.Fill;
+        _progressTree.HideSelection = false;
+        _progressTree.FullRowSelect = true;
+        _progressTree.ShowRootLines = true;
+        _progressTree.ShowPlusMinus = true;
+        _progressTree.ShowLines = true;
+        _progressTree.BorderStyle = BorderStyle.FixedSingle;
+        _progressTree.Font = new Font("Segoe UI", 9f);
+
+        progressLayout.Controls.Add(_progressSummary, 0, 0);
+        progressLayout.Controls.Add(_progressTree, 0, 1);
+        progressPage.Controls.Add(progressLayout);
+
+        _outputTabs.TabPages.Add(logPage);
+        _outputTabs.TabPages.Add(progressPage);
+
+        bottom.Controls.Add(_outputTabs);
         bottom.Controls.Add(actions);
         return bottom;
     }
@@ -432,11 +483,12 @@ public sealed class MainForm : Form
             return;
 
         var job = CaptureJob(pid);
+        var batchId = BeginProgressBatch(job, job.Dlls.Where(d => d.Enabled).ToList());
         _injecting = true;
         _btnInject.Enabled = false;
         try
         {
-            await Task.Run(() => InjectAll(job));
+            await Task.Run(() => InjectAll(job, batchId));
         }
         finally
         {
@@ -445,10 +497,491 @@ public sealed class MainForm : Form
         }
     }
 
-    private void InjectAll(InjectionJob job)
+    private long BeginProgressBatch(InjectionJob job, IReadOnlyList<(string Path, bool Enabled)> enabledDlls)
+    {
+        var batchId = ++_progressBatchId;
+        _progressNodes.Clear();
+        _progressDllNodes.Clear();
+        _progressRecoveryNodes.Clear();
+        _progressHistory.Clear();
+        _progressMethod = job.Method;
+        _progressTargetContext = $"Looking for '{job.ProcessName}' · {job.Method}";
+        _progressTree.BeginUpdate();
+        _progressTree.Nodes.Clear();
+        foreach (var dll in enabledDlls)
+        {
+            var path = dll.Path;
+            var pathKey = ProgressPathKey(path);
+            var stages = BuildProgressPlan(job);
+            var node = new TreeNode($"{Path.GetFileName(path)} · 0/{stages.Count} stages succeeded")
+            {
+                Tag = path,
+                ToolTipText = path
+            };
+            _progressTree.Nodes.Add(node);
+            _progressDllNodes[(batchId, pathKey)] = node;
+            foreach (var plan in stages)
+            {
+                var pending = new InjectionProgressEvent(plan.Id, plan.Name, InjectionProgressStatus.Pending);
+                var stageNode = CreateProgressNode(pending);
+                node.Nodes.Add(stageNode);
+                _progressNodes[(batchId, pathKey, plan.Id)] = stageNode;
+            }
+            var recovery = new TreeNode("Cleanup and recovery · details") { Tag = "recovery-group" };
+            node.Nodes.Add(recovery);
+            _progressRecoveryNodes[(batchId, pathKey)] = recovery;
+            node.Expand();
+        }
+        _progressTree.EndUpdate();
+        _progressSummary.Text = enabledDlls.Count == 0
+            ? $"No enabled DLLs in this batch · {_progressTargetContext}"
+            : $"Current batch · {_progressTargetContext} · {enabledDlls.Count} DLL(s) · 0/{_progressNodes.Count} stages succeeded";
+        if (_outputTabs.TabPages.Count > 1)
+            _outputTabs.SelectedIndex = 1;
+        return batchId;
+    }
+
+    private static IReadOnlyList<ProgressStagePlan> BuildProgressPlan(InjectionJob job)
+    {
+        var stages = new List<ProgressStagePlan>
+        {
+            new("input-check", "Validate selected DLL")
+        };
+        if (job.Scramble != ScramblePreset.None)
+            stages.Add(new ProgressStagePlan("scramble", "Prepare optional scrambled copy"));
+        stages.Add(new ProgressStagePlan("preflight", "Check method, target access, and architecture"));
+
+        stages.AddRange(job.Method switch
+        {
+            InjectionMethod.Standard => new[]
+            {
+                new ProgressStagePlan("method-open", "Open target process"),
+                new ProgressStagePlan("method-run", "Run LoadLibraryW in target"),
+                new ProgressStagePlan("method-base", "Verify returned module address")
+            },
+            InjectionMethod.LdrLoadDll => new[]
+            {
+                new ProgressStagePlan("method-open", "Open target process"),
+                new ProgressStagePlan("method-prepare", "Prepare LdrLoadDll call"),
+                new ProgressStagePlan("method-run", "Run LdrLoadDll in target"),
+                new ProgressStagePlan("method-result", "Verify loaded module handle")
+            },
+            InjectionMethod.ThreadHijack => new[]
+            {
+                new ProgressStagePlan("method-thread", "Find a suitable target thread"),
+                new ProgressStagePlan("method-prepare", "Prepare loader stub"),
+                new ProgressStagePlan("method-run", "Wait for loader stub completion"),
+                new ProgressStagePlan("method-restore", "Restore original thread state"),
+                new ProgressStagePlan("method-result", "Verify loader result")
+            },
+            InjectionMethod.ManualMap => new[]
+            {
+                new ProgressStagePlan("method-map", "Validate and map payload image"),
+                new ProgressStagePlan("method-layout", "Apply relocations and validate metadata"),
+                new ProgressStagePlan("method-imports", "Resolve image imports"),
+                new ProgressStagePlan("method-write", "Write and protect image sections"),
+                new ProgressStagePlan("method-unwind", "Validate unwind metadata"),
+                new ProgressStagePlan("method-init", "Initialize mapped image")
+            },
+            InjectionMethod.DllHollowing => new[]
+            {
+                new ProgressStagePlan("method-carrier", "Prepare carrier image and backup"),
+                new ProgressStagePlan("method-thread", "Find a suitable target thread"),
+                new ProgressStagePlan("method-layout", "Prepare payload and resolve imports"),
+                new ProgressStagePlan("method-write", "Write and protect payload image"),
+                new ProgressStagePlan("method-init", "Initialize payload and verify result")
+            },
+            InjectionMethod.ModuleStomping => new[]
+            {
+                new ProgressStagePlan("method-payload", "Validate payload and open target"),
+                new ProgressStagePlan("method-host", "Find a suitable host module"),
+                new ProgressStagePlan("method-thread", "Find a suitable target thread"),
+                new ProgressStagePlan("method-backup", "Suspend peers and back up host image"),
+                new ProgressStagePlan("method-layout", "Prepare payload and resolve imports"),
+                new ProgressStagePlan("method-write", "Overwrite and protect host image"),
+                new ProgressStagePlan("method-init", "Initialize payload and restore thread state")
+            },
+            _ => new[] { new ProgressStagePlan("method-run", "Run selected injection method") }
+        });
+
+        if (job.ErasePe)
+            stages.Add(new ProgressStagePlan("postinject-erase", "Erase PE headers"));
+        if (job.HideModule)
+            stages.Add(new ProgressStagePlan("postinject-hide", "Hide module from loader lists"));
+        return stages;
+    }
+
+    private static string ProgressPathKey(string path)
+    {
+        try { return Path.GetFullPath(path).ToLowerInvariant(); }
+        catch { return path.ToLowerInvariant(); }
+    }
+
+    private void SetProgressTargetContext(string target, uint pid, long batchId)
+    {
+        try
+        {
+            if (InvokeRequired)
+            {
+                if (IsDisposed || !IsHandleCreated) return;
+                BeginInvoke((Action)(() => SetProgressTargetContext(target, pid, batchId)));
+                return;
+            }
+            if (IsDisposed || batchId != _progressBatchId) return;
+            _progressTargetContext = $"Injecting into {target} (PID {pid}) · {_progressMethod}";
+            UpdateProgressSummary();
+        }
+        catch (ObjectDisposedException) { }
+        catch (InvalidOperationException) { }
+        catch (Exception) { }
+    }
+
+    private void ReportProgress(string dllPath, InjectionProgressEvent progress, long batchId)
+    {
+        try
+        {
+            if (InvokeRequired)
+            {
+                if (IsDisposed || !IsHandleCreated)
+                    return;
+                BeginInvoke((Action)(() => ReportProgress(dllPath, progress, batchId)));
+                return;
+            }
+            if (IsDisposed || batchId != _progressBatchId)
+                return;
+
+            var pathKey = ProgressPathKey(dllPath);
+            if (!_progressDllNodes.TryGetValue((batchId, pathKey), out var dllNode))
+                return;
+
+            var plannedId = ResolveProgressStage(_progressMethod, progress.StageId);
+            if (plannedId is not null && _progressNodes.TryGetValue((batchId, pathKey, plannedId), out var stageNode))
+            {
+                var planned = (InjectionProgressEvent)stageNode.Tag!;
+                var status = NormalizeProgressStatus(_progressMethod, plannedId, progress);
+                ApplyProgress(stageNode, progress with { StageId = plannedId, Name = planned.Name, Status = status }, progress);
+                stageNode.EnsureVisible();
+            }
+            else if (progress.StageId is "scramble-dll" or "postinject-erase" or "postinject-hide")
+            {
+                // Optional work that was not requested has no planned row.
+            }
+            else
+            {
+                if (!_progressRecoveryNodes.TryGetValue((batchId, pathKey), out var recovery))
+                    return;
+                var nodeKey = (batchId, pathKey, "recovery:" + progress.StageId);
+                if (!_progressNodes.TryGetValue(nodeKey, out var detailNode))
+                {
+                    detailNode = CreateProgressNode(progress);
+                    recovery.Nodes.Add(detailNode);
+                    _progressNodes[nodeKey] = detailNode;
+                }
+                ApplyProgress(detailNode, progress);
+                if (progress.Status is InjectionProgressStatus.Running or InjectionProgressStatus.Failed or InjectionProgressStatus.Warning)
+                    recovery.Expand();
+            }
+
+            UpdateProgressSummary();
+        }
+        catch (ObjectDisposedException) { }
+        catch (InvalidOperationException) { }
+        catch (Exception) { /* UI reporting must never interfere with an injection attempt. */ }
+    }
+
+    private static string? ResolveProgressStage(InjectionMethod method, string stageId)
+    {
+        if (stageId == "input-check") return "input-check";
+        if (stageId is "validate-dll" or "method-support" or "target-preflight" or "target-architecture")
+            return "preflight";
+        if (stageId == "scramble-dll") return "scramble";
+        if (stageId is "postinject-erase" or "postinject-hide") return stageId;
+
+        return method switch
+        {
+            InjectionMethod.Standard => stageId switch
+            {
+                "standard-open" => "method-open",
+                "standard-load" => "method-run",
+                "standard-base" => "method-base",
+                _ => null
+            },
+            InjectionMethod.LdrLoadDll => stageId switch
+            {
+                "ldr-open" => "method-open",
+                "ldr-prepare" => "method-prepare",
+                "ldr-run" => "method-run",
+                "ldr-handle" => "method-result",
+                _ => null
+            },
+            InjectionMethod.ThreadHijack => stageId switch
+            {
+                "hijack-open" or "hijack-enumerate" or "hijack-context" or "hijack-select" => "method-thread",
+                "hijack-stub" => "method-prepare",
+                "hijack-run" => "method-run",
+                "hijack-restore" => "method-restore",
+                "hijack-result" => "method-result",
+                _ => null
+            },
+            InjectionMethod.ManualMap => stageId switch
+            {
+                "manual-parse" or "manual-open" or "manual-map" => "method-map",
+                "manual-layout" => "method-layout",
+                "manual-imports" => "method-imports",
+                "manual-write" => "method-write",
+                "manual-unwind" => "method-unwind",
+                "manual-initialize" or "manual-run-init" => "method-init",
+                _ => null
+            },
+            InjectionMethod.DllHollowing => stageId switch
+            {
+                "hollow-parse" or "hollow-open" or "hollow-carrier" or "hollow-section" or "hollow-backup" => "method-carrier",
+                "hollow-threads" or "hollow-context" or "hollow-thread-select" => "method-thread",
+                "hollow-layout" or "hollow-imports" => "method-layout",
+                "hollow-write" => "method-write",
+                "hollow-init-prepare" or "hollow-init-wait" or "hollow-thread-restore" or "hollow-init-result" => "method-init",
+                _ => null
+            },
+            InjectionMethod.ModuleStomping => stageId switch
+            {
+                "stomp-parse" or "stomp-open" => "method-payload",
+                "stomp-host" => "method-host",
+                "stomp-threads" or "stomp-thread-select" => "method-thread",
+                "stomp-backup" => "method-backup",
+                "stomp-layout" => "method-layout",
+                "stomp-write" => "method-write",
+                "stomp-init" => "method-init",
+                _ => null
+            },
+            _ => null
+        };
+    }
+
+    private static InjectionProgressStatus NormalizeProgressStatus(InjectionMethod method, string plannedId,
+        InjectionProgressEvent progress)
+    {
+        if (progress.Status == InjectionProgressStatus.Succeeded && !IsVerifiedGroupCompletion(method, plannedId, progress.StageId))
+            return InjectionProgressStatus.Running;
+
+        if (method == InjectionMethod.ManualMap && plannedId == "method-init" &&
+            progress.StageId == "manual-initialize" && progress.Status == InjectionProgressStatus.Skipped)
+            return InjectionProgressStatus.Succeeded;
+
+        return progress.Status;
+    }
+
+    private static bool IsVerifiedGroupCompletion(InjectionMethod method, string plannedId, string eventId)
+    {
+        if (plannedId == "preflight")
+            return eventId == "target-architecture";
+
+        return method switch
+        {
+            InjectionMethod.ManualMap => plannedId switch
+            {
+                "method-map" => eventId == "manual-map",
+                "method-layout" => eventId == "manual-layout",
+                "method-imports" => eventId == "manual-imports",
+                "method-write" => eventId == "manual-write",
+                "method-unwind" => eventId == "manual-unwind",
+                "method-init" => eventId == "manual-run-init",
+                _ => true
+            },
+            InjectionMethod.ThreadHijack => plannedId == "method-thread"
+                ? eventId == "hijack-select"
+                : true,
+            InjectionMethod.DllHollowing => plannedId switch
+            {
+                "method-carrier" => eventId == "hollow-backup",
+                "method-thread" => eventId == "hollow-thread-select",
+                "method-layout" => eventId == "hollow-imports",
+                "method-write" => eventId == "hollow-write",
+                "method-init" => eventId == "hollow-init-result",
+                _ => true
+            },
+            InjectionMethod.ModuleStomping => plannedId switch
+            {
+                "method-payload" => eventId == "stomp-open",
+                "method-host" => eventId == "stomp-host",
+                "method-thread" => eventId == "stomp-thread-select",
+                "method-backup" => eventId == "stomp-backup",
+                "method-layout" => eventId == "stomp-layout",
+                "method-write" => eventId == "stomp-write",
+                "method-init" => eventId == "stomp-init",
+                _ => true
+            },
+            _ => true
+        };
+    }
+
+    private static TreeNode CreateProgressNode(InjectionProgressEvent progress)
+        => new() { Tag = progress, Text = $"{ProgressGlyph(progress.Status)} {progress.Name} — {ProgressStatusLabel(progress.Status)}", ForeColor = ProgressColor(progress.Status) };
+
+    private void ApplyProgress(TreeNode stageNode, InjectionProgressEvent progress,
+        InjectionProgressEvent? historyEvent = null)
+    {
+        stageNode.Tag = progress;
+        stageNode.Text = $"{ProgressGlyph(progress.Status)} {progress.Name} — {ProgressStatusLabel(progress.Status)}";
+        stageNode.ForeColor = ProgressColor(progress.Status);
+        stageNode.ToolTipText = string.Join(Environment.NewLine,
+            new[] { progress.Details, progress.TechnicalDetails }.Where(value => !string.IsNullOrWhiteSpace(value)));
+
+        if (!_progressHistory.TryGetValue(stageNode, out var history))
+        {
+            history = new List<(DateTimeOffset At, InjectionProgressEvent Event)>();
+            _progressHistory[stageNode] = history;
+        }
+        history.Add((DateTimeOffset.Now, historyEvent ?? progress));
+        if (history.Count > ProgressHistoryCapacity)
+            history.RemoveRange(0, history.Count - ProgressHistoryCapacity);
+
+        stageNode.Nodes.Clear();
+        foreach (var entry in history)
+        {
+            var update = entry.Event;
+            var eventNode = new TreeNode($"{entry.At:HH:mm:ss.fff} · {ProgressGlyph(update.Status)} {update.Name} — {ProgressStatusLabel(update.Status)}")
+            {
+                ForeColor = ProgressColor(update.Status),
+                ToolTipText = string.Join(Environment.NewLine,
+                    new[] { update.Details, update.TechnicalDetails }.Where(value => !string.IsNullOrWhiteSpace(value)))
+            };
+            if (!string.IsNullOrWhiteSpace(update.Details))
+                eventNode.Nodes.Add(new TreeNode("Details: " + update.Details));
+            if (!string.IsNullOrWhiteSpace(update.TechnicalDetails))
+                eventNode.Nodes.Add(new TreeNode("Technical: " + update.TechnicalDetails));
+            stageNode.Nodes.Add(eventNode);
+        }
+    }
+
+    private void CompleteProgressDll(string dllPath, long batchId)
+    {
+        try
+        {
+            if (InvokeRequired)
+            {
+                if (IsDisposed || !IsHandleCreated) return;
+                BeginInvoke((Action)(() => CompleteProgressDll(dllPath, batchId)));
+                return;
+            }
+            if (IsDisposed || batchId != _progressBatchId) return;
+            var pathKey = ProgressPathKey(dllPath);
+            if (!_progressDllNodes.TryGetValue((batchId, pathKey), out var dllNode)) return;
+            foreach (TreeNode stageNode in dllNode.Nodes)
+            {
+                if (stageNode.Tag is not InjectionProgressEvent current || current.Status != InjectionProgressStatus.Pending)
+                    continue;
+                ApplyProgress(stageNode, current with
+                {
+                    Status = InjectionProgressStatus.Skipped,
+                    Details = "Not reached before this DLL operation finished."
+                });
+            }
+            UpdateProgressSummary();
+        }
+        catch (ObjectDisposedException) { }
+        catch (InvalidOperationException) { }
+        catch (Exception) { }
+    }
+
+    private void FailProgressBatch(long batchId, string reason)
+    {
+        try
+        {
+            if (InvokeRequired)
+            {
+                if (IsDisposed || !IsHandleCreated) return;
+                BeginInvoke((Action)(() => FailProgressBatch(batchId, reason)));
+                return;
+            }
+            if (IsDisposed || batchId != _progressBatchId) return;
+            foreach (var entry in _progressDllNodes.Where(pair => pair.Key.Batch == batchId))
+            {
+                var pathKey = entry.Key.Path;
+                foreach (TreeNode stageNode in entry.Value.Nodes)
+                {
+                    if (stageNode.Tag is not InjectionProgressEvent current || current.Status != InjectionProgressStatus.Pending)
+                        continue;
+                    var isPreflight = current.StageId == "preflight";
+                    ApplyProgress(stageNode, current with
+                    {
+                        Status = isPreflight ? InjectionProgressStatus.Failed : InjectionProgressStatus.Skipped,
+                        Details = reason
+                    });
+                }
+                var planned = _progressNodes.Where(pair => pair.Key.Batch == batchId && pair.Key.Path == pathKey &&
+                    !pair.Key.Stage.StartsWith("recovery:", StringComparison.Ordinal)).ToArray();
+                entry.Value.Text = $"{Path.GetFileName((string)entry.Value.Tag!)} · {planned.Count(pair => pair.Value.Tag is InjectionProgressEvent update && update.Status == InjectionProgressStatus.Succeeded)}/{planned.Length} stages succeeded";
+            }
+            UpdateProgressSummary(reason);
+        }
+        catch (ObjectDisposedException) { }
+        catch (InvalidOperationException) { }
+        catch (Exception) { }
+    }
+
+    private void UpdateProgressSummary(string? batchReason = null)
+    {
+        var nodes = _progressNodes.Where(pair => pair.Key.Batch == _progressBatchId && !pair.Key.Stage.StartsWith("recovery:", StringComparison.Ordinal))
+            .Select(pair => pair.Value).Where(node => node.Tag is InjectionProgressEvent).ToArray();
+        var updates = nodes.Select(node => (InjectionProgressEvent)node.Tag!).ToArray();
+        var succeeded = updates.Count(update => update.Status == InjectionProgressStatus.Succeeded);
+        var total = updates.Length;
+        var running = updates.Count(update => update.Status == InjectionProgressStatus.Running);
+        var failed = updates.Count(update => update.Status == InjectionProgressStatus.Failed);
+        var warnings = updates.Count(update => update.Status == InjectionProgressStatus.Warning);
+        var skipped = updates.Count(update => update.Status == InjectionProgressStatus.Skipped);
+        _progressSummary.Text = string.IsNullOrWhiteSpace(batchReason)
+            ? $"Current batch · {_progressTargetContext} · {succeeded}/{total} stages succeeded · {running} running · {failed} failed · {warnings} warnings · {skipped} skipped"
+            : $"Batch stopped · {_progressTargetContext} · {batchReason} · {succeeded}/{total} stages succeeded";
+
+        foreach (var entry in _progressDllNodes.Where(pair => pair.Key.Batch == _progressBatchId))
+        {
+            var planned = _progressNodes.Where(pair => pair.Key.Batch == entry.Key.Batch && pair.Key.Path == entry.Key.Path &&
+                    !pair.Key.Stage.StartsWith("recovery:", StringComparison.Ordinal))
+                .Select(pair => pair.Value.Tag).OfType<InjectionProgressEvent>().ToArray();
+            var dllSucceeded = planned.Count(update => update.Status == InjectionProgressStatus.Succeeded);
+            entry.Value.Text = $"{Path.GetFileName((string)entry.Value.Tag!)} · {dllSucceeded}/{planned.Length} stages succeeded";
+        }
+    }
+
+    private static string ProgressGlyph(InjectionProgressStatus status) => status switch
+    {
+        InjectionProgressStatus.Running => "…",
+        InjectionProgressStatus.Pending => "·",
+        InjectionProgressStatus.Succeeded => "✓",
+        InjectionProgressStatus.Failed => "×",
+        InjectionProgressStatus.Warning => "!",
+        InjectionProgressStatus.Skipped => "–",
+        _ => "·"
+    };
+
+    private static string ProgressStatusLabel(InjectionProgressStatus status) => status switch
+    {
+        InjectionProgressStatus.Running => "running",
+        InjectionProgressStatus.Pending => "pending",
+        InjectionProgressStatus.Succeeded => "succeeded",
+        InjectionProgressStatus.Failed => "failed",
+        InjectionProgressStatus.Warning => "warning",
+        InjectionProgressStatus.Skipped => "skipped",
+        _ => "pending"
+    };
+
+    private static Color ProgressColor(InjectionProgressStatus status) => status switch
+    {
+        InjectionProgressStatus.Running => Color.FromArgb(0, 122, 204),
+        InjectionProgressStatus.Pending => SystemColors.GrayText,
+        InjectionProgressStatus.Succeeded => Color.FromArgb(0, 145, 90),
+        InjectionProgressStatus.Failed => Color.FromArgb(205, 70, 70),
+        InjectionProgressStatus.Warning => Color.FromArgb(180, 125, 25),
+        InjectionProgressStatus.Skipped => SystemColors.GrayText,
+        _ => SystemColors.ControlText
+    };
+
+    private void InjectAll(InjectionJob job, long batchId)
     {
         if (job.ProcessName.Length == 0)
         {
+            FailProgressBatch(batchId, "Enter a process name first.");
             Log("Enter a process name first.");
             return;
         }
@@ -458,13 +991,17 @@ public sealed class MainForm : Form
         var process = job.Pid != 0 ? ProcessManager.GetByPid(job.Pid) : ProcessManager.GetByName(job.ProcessName);
         if (process is null)
         {
+            var reason = job.Pid != 0
+                ? $"Process with PID {job.Pid} no longer exists."
+                : $"Process '{job.ProcessName}' not found.";
+            FailProgressBatch(batchId, reason);
             Log(job.Pid != 0
                 ? $"Process with PID {job.Pid} no longer exists."
                 : $"Process '{job.ProcessName}' not found.");
             return;
         }
 
-        var enabled = job.Dlls.Where(d => d.Enabled && File.Exists(d.Path)).ToList();
+        var enabled = job.Dlls.Where(d => d.Enabled).ToList();
         if (enabled.Count == 0)
         {
             Log("No enabled DLLs to inject.");
@@ -476,15 +1013,19 @@ public sealed class MainForm : Form
         var expectedCreationTime = job.ExpectedCreationTime ?? process.CreationTime;
         if (expectedCreationTime is not long expected)
         {
+            FailProgressBatch(batchId, $"Could not verify the start time for PID {process.Pid}; injection was stopped.");
             Log($"Could not verify the start time for PID {process.Pid}; injection was stopped.");
             return;
         }
 
         if (job.ExpectedCreationTime is long selected && process.CreationTime != selected)
         {
+            FailProgressBatch(batchId, $"PID {process.Pid} no longer refers to the process instance selected in the picker.");
             Log($"PID {process.Pid} no longer refers to the process instance selected in the picker.");
             return;
         }
+
+        SetProgressTargetContext(process.Name, process.Pid, batchId);
 
         // Keep the selected creation time as the expected identity for every
         // DLL in this batch. Injector reopens must match this exact timestamp.
@@ -494,20 +1035,51 @@ public sealed class MainForm : Form
         {
             var toInject = dllPath;
             string? scrambled = null;
+            Action<InjectionProgressEvent> reportProgress = progress => ReportProgress(dllPath, progress, batchId);
             try
             {
+                if (!File.Exists(dllPath))
+                {
+                    reportProgress(new InjectionProgressEvent("input-check", "Validate selected DLL",
+                        InjectionProgressStatus.Failed, "DLL file does not exist.", dllPath));
+                    Log($"  [FAIL] {Path.GetFileName(dllPath)}: DLL file does not exist.");
+                    continue;
+                }
+
+                reportProgress(new InjectionProgressEvent("input-check", "Validate selected DLL",
+                    InjectionProgressStatus.Succeeded, "Enabled DLL file exists and can be passed to the selected method.", dllPath));
+
                 if (job.Scramble != ScramblePreset.None)
                 {
-                    scrambled = Scrambler.Scramble(dllPath, job.Scramble);
+                    reportProgress(new InjectionProgressEvent("scramble-dll", "Scramble DLL",
+                        InjectionProgressStatus.Running, $"Applying the {job.Scramble} preset."));
+                    try
+                    {
+                        scrambled = Scrambler.Scramble(dllPath, job.Scramble);
+                    }
+                    catch (Exception ex)
+                    {
+                        reportProgress(new InjectionProgressEvent("scramble-dll", "Scramble DLL",
+                            InjectionProgressStatus.Failed, "Could not create the temporary scrambled copy.", ex.Message));
+                        throw;
+                    }
                     toInject = scrambled;
+                    reportProgress(new InjectionProgressEvent("scramble-dll", "Scramble DLL",
+                        InjectionProgressStatus.Succeeded, $"Temporary {job.Scramble} copy is ready."));
                     Log($"  Scrambled {Path.GetFileName(dllPath)} ({job.Scramble}) -> temp copy.");
+                }
+                else
+                {
+                    reportProgress(new InjectionProgressEvent("scramble-dll", "Scramble DLL",
+                        InjectionProgressStatus.Skipped, "Scrambling was not requested."));
                 }
 
                 var options = new InjectionOptions
                 {
                     Method = job.Method,
                     ErasePeHeaders = job.ErasePe,
-                    HideModule = job.HideModule
+                    HideModule = job.HideModule,
+                    ProgressChanged = reportProgress
                 };
 
                 var result = Injector.Inject(process.Pid, toInject, options, expected);
@@ -552,15 +1124,34 @@ public sealed class MainForm : Form
             {
                 if (scrambled is not null)
                 {
-                    try { File.Delete(scrambled); } catch { /* best effort */ }
+                    reportProgress(new InjectionProgressEvent("scramble-cleanup", "Remove scrambled temporary copy",
+                        InjectionProgressStatus.Running));
+                    try
+                    {
+                        File.Delete(scrambled);
+                        var removed = !File.Exists(scrambled);
+                        reportProgress(new InjectionProgressEvent("scramble-cleanup", "Remove scrambled temporary copy",
+                            removed ? InjectionProgressStatus.Succeeded : InjectionProgressStatus.Warning,
+                            removed ? "Temporary copy removed." : "Temporary copy still exists.", scrambled));
+                    }
+                    catch (Exception ex)
+                    {
+                        reportProgress(new InjectionProgressEvent("scramble-cleanup", "Remove scrambled temporary copy",
+                            InjectionProgressStatus.Warning, "Temporary copy could not be removed.", ex.Message));
+                    }
                 }
+                CompleteProgressDll(dllPath, batchId);
             }
         }
 
         Log($"Done. {succeeded}/{enabled.Count} succeeded.");
 
         if (succeeded > 0 && job.CloseOnInject && IsHandleCreated && !IsDisposed)
-            BeginInvoke((Action)Close);
+        {
+            try { BeginInvoke((Action)Close); }
+            catch (ObjectDisposedException) { }
+            catch (InvalidOperationException) { }
+        }
     }
 
     private void StartWatcher()

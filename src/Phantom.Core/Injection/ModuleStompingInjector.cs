@@ -46,10 +46,24 @@ internal sealed unsafe class ModuleStompingInjector : InjectorBase
     public override InjectionResult Inject(uint pid, string dllPath, InjectionOptions options)
     {
         IntPtr hProcess = IntPtr.Zero;
+
+        void CloseTarget()
+        {
+            if (hProcess == IntPtr.Zero)
+                return;
+            options.ReportProgress("stomp-target-close", "Close target handle", InjectionProgressStatus.Running);
+            var closed = NativeMethods.CloseHandle(hProcess);
+            options.ReportProgress("stomp-target-close", "Close target handle",
+                closed ? InjectionProgressStatus.Succeeded : InjectionProgressStatus.Warning,
+                closed ? "Target handle closed." : "Target handle close reported an error.");
+            hProcess = IntPtr.Zero;
+        }
+
         try
         {
             DirectSyscalls.Initialize();
 
+            options.ReportProgress("stomp-parse", "Read and validate payload image", InjectionProgressStatus.Running);
             PeImage pe;
             try
             {
@@ -57,42 +71,65 @@ internal sealed unsafe class ModuleStompingInjector : InjectorBase
             }
             catch (BadImageFormatException ex)
             {
+                options.ReportProgress("stomp-parse", "Read and validate payload image", InjectionProgressStatus.Failed,
+                    "Payload is not a valid PE image.", ex.Message);
                 return InjectionResult.Fail(Method, dllPath, "Invalid PE image: " + ex.Message);
             }
+            options.ReportProgress("stomp-parse", "Read and validate payload image", InjectionProgressStatus.Succeeded,
+                $"Payload image validated ({pe.SizeOfImage:N0} bytes).");
 
+            options.ReportProgress("stomp-open", "Open target process", InjectionProgressStatus.Running);
             try
             {
                 hProcess = OpenRemoteProcess(pid, InjectionAccess);
             }
             catch (Exception ex)
             {
+                options.ReportProgress("stomp-open", "Open target process", InjectionProgressStatus.Failed, ex.Message);
                 return InjectionResult.Fail(Method, dllPath, "OpenProcess failed: " + ex.Message);
             }
+            options.ReportProgress("stomp-open", "Open target process", InjectionProgressStatus.Succeeded,
+                "Verified target handle opened.");
 
+            options.ReportProgress("stomp-host", "Find a suitable host module", InjectionProgressStatus.Running,
+                "Checking loaded non-critical images for sufficient executable capacity.");
             var stompTarget = FindStompTarget(hProcess, pe, out var targetFailure);
             var stompBase = stompTarget.BaseAddress;
             var stompPe = stompTarget.PeInfo;
             if (stompBase == IntPtr.Zero || stompPe is null)
             {
-                NativeMethods.CloseHandle(hProcess);
+                options.ReportProgress("stomp-host", "Find a suitable host module", InjectionProgressStatus.Failed,
+                    targetFailure ?? "No suitable host module was found.");
+                CloseTarget();
                 return InjectionResult.Fail(Method, dllPath, targetFailure ??
                     "Could not find a suitable module to stomp (need SizeOfImage and executable-section capacity >= payload).");
             }
+            options.ReportProgress("stomp-host", "Find a suitable host module", InjectionProgressStatus.Succeeded,
+                $"Selected host module at 0x{stompBase.ToInt64():X} with enough image and executable-section capacity.");
 
+            options.ReportProgress("stomp-threads", "Enumerate target threads", InjectionProgressStatus.Running);
             var threads = ProcessManager.GetThreads(pid).OrderBy(t => t.ThreadId).ToList();
             if (threads.Count == 0)
             {
-                NativeMethods.CloseHandle(hProcess);
+                options.ReportProgress("stomp-threads", "Enumerate target threads", InjectionProgressStatus.Failed,
+                    "The target has no threads to hijack.");
+                CloseTarget();
                 return InjectionResult.Fail(Method, dllPath, "The target has no threads to hijack.");
             }
+            options.ReportProgress("stomp-threads", "Enumerate target threads", InjectionProgressStatus.Succeeded,
+                $"Found {threads.Count} thread candidate(s).");
 
+            options.ReportProgress("stomp-thread-select", "Find a suitable hijack thread", InjectionProgressStatus.Running,
+                "Checking thread context, stack margin, and suspend rights.");
             foreach (var candidate in threads)
             {
                 if (!TrySuspendCandidate(candidate.ThreadId, out var hThread, out var acquireError))
                 {
                     if (acquireError is not null)
                     {
-                        NativeMethods.CloseHandle(hProcess);
+                        options.ReportProgress("stomp-thread-select", "Find a suitable hijack thread", InjectionProgressStatus.Failed,
+                            acquireError);
+                        CloseTarget();
                         return InjectionResult.Fail(Method, dllPath, acquireError);
                     }
                     continue;
@@ -101,29 +138,41 @@ internal sealed unsafe class ModuleStompingInjector : InjectorBase
                 var outcome = TryHijackAndStomp(
                     pid, hProcess, hThread, candidate.ThreadId, dllPath,
                     pe, stompBase, stompPe, options,
-                    out var corrupted);
+                    out var corrupted, out var threadSelected, out var initStarted);
 
                 NativeMethods.CloseHandle(hThread);
 
                 if (outcome is null)
                     continue; // Unsuitable thread.
 
+                if (initStarted)
+                {
+                    options.ReportProgress("stomp-init", "Initialize payload and restore thread state",
+                        outcome.Success ? InjectionProgressStatus.Succeeded : InjectionProgressStatus.Failed,
+                        outcome.Success ? "Initialization completed and the original thread state was restored." : outcome.Error,
+                        corrupted ? "The host may be corrupted or threads may remain suspended; see the failure details." : null);
+                }
+                else if (!threadSelected)
+                {
+                    options.ReportProgress("stomp-thread-select", "Find a suitable hijack thread", InjectionProgressStatus.Failed,
+                        outcome.Error ?? "The candidate thread could not be prepared safely.");
+                }
+
                 // On success or hazard the process handle is still ours to close;
                 // the remote state (stomped image / parked stub) stays as reported.
-                NativeMethods.CloseHandle(hProcess);
-                hProcess = IntPtr.Zero;
+                CloseTarget();
                 _ = corrupted;
                 return outcome;
             }
 
-            NativeMethods.CloseHandle(hProcess);
-            hProcess = IntPtr.Zero;
+            options.ReportProgress("stomp-thread-select", "Find a suitable hijack thread", InjectionProgressStatus.Failed,
+                "No hijackable thread with a known, sufficiently large stack was found.");
+            CloseTarget();
             return InjectionResult.Fail(Method, dllPath, "No hijackable thread with a known, sufficiently large stack was found.");
         }
         catch (Exception ex)
         {
-            if (hProcess != IntPtr.Zero)
-                NativeMethods.CloseHandle(hProcess);
+            CloseTarget();
             return InjectionResult.Fail(Method, dllPath, ex.Message);
         }
     }
@@ -314,9 +363,13 @@ internal sealed unsafe class ModuleStompingInjector : InjectorBase
         IntPtr remoteBase,
         PeImage targetPe,
         InjectionOptions options,
-        out bool corrupted)
+        out bool corrupted,
+        out bool threadSelected,
+        out bool initStarted)
     {
         corrupted = false;
+        threadSelected = false;
+        initStarted = false;
         var contextBuffer = IntPtr.Zero;
         CONTEXT_X64* ctx = null;
         var originalRip = 0UL;
@@ -479,6 +532,12 @@ internal sealed unsafe class ModuleStompingInjector : InjectorBase
                 Release();
                 return null;
             }
+            options.ReportProgress("stomp-thread-select", "Find a suitable hijack thread", InjectionProgressStatus.Succeeded,
+                $"Thread {threadId} has a restorable context and sufficient stack margin.");
+            threadSelected = true;
+
+            options.ReportProgress("stomp-backup", "Suspend peers and back up host image", InjectionProgressStatus.Running,
+                "Suspending other target threads and capturing host bytes and page protections before mutation.");
 
             // ---- Suspend every other thread: a running thread could otherwise
             // execute the carrier mid-overwrite (unrecoverable by rollback). ----
@@ -507,8 +566,12 @@ internal sealed unsafe class ModuleStompingInjector : InjectorBase
                 Release();
                 return InjectionResult.Fail(Method, dllPath, "Could not query host page protections before stomping: " + ex.Message);
             }
+            options.ReportProgress("stomp-backup", "Suspend peers and back up host image", InjectionProgressStatus.Succeeded,
+                $"Captured {backupSize:N0} host bytes and {origProtections.Count} page-protection range(s).");
 
             // ---- Build + validate payload image locally (no remote side effects) ----
+            options.ReportProgress("stomp-layout", "Prepare payload and resolve imports", InjectionProgressStatus.Running,
+                "Applying relocations, validating TLS and unwind metadata, and resolving imports.");
             var image = ReflectiveMapper.BuildMappedImage(pe);
             var delta = (long)remoteBase.ToInt64() - (long)pe.ImageBase;
             if (!ReflectiveMapper.TryApplyRelocations(pe, image, delta, out var relocError))
@@ -544,10 +607,14 @@ internal sealed unsafe class ModuleStompingInjector : InjectorBase
                 ReleaseDependencies(hProcess, pid, dependencies, options.TimeoutMs);
                 return InjectionResult.Fail(Method, dllPath, imports.Error ?? "Import resolution failed; host module untouched.");
             }
+            options.ReportProgress("stomp-layout", "Prepare payload and resolve imports", InjectionProgressStatus.Succeeded,
+                $"Payload prepared and {dependencies.Count} dependency reference(s) resolved.");
 
             // ---- Overwrite: RW headers + overlapped host sections FIRST, then
             // write the complete image. A direct NtWrite cannot span guarded
             // pages, so writing before protecting risks failure/partial write.
+            options.ReportProgress("stomp-write", "Overwrite and protect host image", InjectionProgressStatus.Running,
+                "Temporarily changing host protections, writing the mapped payload, and applying final section protections.");
             {
                 var headerSize = (ulong)Math.Min(pe.SizeOfHeaders, (uint)backupSize);
                 if (headerSize != 0)
@@ -613,7 +680,12 @@ internal sealed unsafe class ModuleStompingInjector : InjectorBase
                     "Could not protect payload sections: " + ex.Message + " Original bytes restored.",
                     "Could not protect payload sections AND rollback failed; the host module may be corrupted. Protect error: " + ex.Message);
             }
+            options.ReportProgress("stomp-write", "Overwrite and protect host image", InjectionProgressStatus.Succeeded,
+                $"Wrote and protected {image.Length:N0} payload bytes in the selected host image.");
 
+            initStarted = true;
+            options.ReportProgress("stomp-init", "Initialize payload and restore thread state", InjectionProgressStatus.Running,
+                "Preparing the loader-lock-aware initialization stub and waiting for verified thread restoration.");
             var entryPoint = pe.AddressOfEntryPoint == 0
                 ? IntPtr.Zero
                 : IntPtr.Add(remoteBase, (int)pe.AddressOfEntryPoint);

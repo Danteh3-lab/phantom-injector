@@ -27,6 +27,15 @@ public static class Theme
         {
             switch (control)
             {
+                case TreeView:
+                    control.BackColor = surface;
+                    control.ForeColor = text;
+                    break;
+                case TabControl:
+                case TabPage:
+                    control.BackColor = back;
+                    control.ForeColor = text;
+                    break;
                 case TextBox:
                 case ListBox:
                 case ListView:

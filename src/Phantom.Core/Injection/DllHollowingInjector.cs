@@ -52,10 +52,49 @@ internal sealed unsafe class DllHollowingInjector : InjectorBase
         UIntPtr viewSize = UIntPtr.Zero;
         var invalidHandle = new IntPtr(-1);
 
+        void UnmapCarrier()
+        {
+            if (hProcess == IntPtr.Zero || remoteBase == IntPtr.Zero)
+                return;
+            options.ReportProgress("hollow-view-release", "Release carrier view", InjectionProgressStatus.Running,
+                "Removing the carrier view after a clean failure.");
+            var status = DirectSyscalls.NtUnmapViewOfSection(hProcess, remoteBase);
+            options.ReportProgress("hollow-view-release", "Release carrier view",
+                status == 0 ? InjectionProgressStatus.Succeeded : InjectionProgressStatus.Failed,
+                status == 0 ? "Carrier view unmapped." : "Carrier view could not be unmapped.",
+                status == 0 ? null : $"NTSTATUS 0x{status:X8}");
+            if (status == 0)
+                remoteBase = IntPtr.Zero;
+        }
+
+        void CloseSection()
+        {
+            if (sectionHandle == IntPtr.Zero)
+                return;
+            var status = DirectSyscalls.NtClose(sectionHandle);
+            options.ReportProgress("hollow-section-close", "Close carrier section", status == 0
+                    ? InjectionProgressStatus.Succeeded : InjectionProgressStatus.Warning,
+                status == 0 ? "Carrier section handle closed." : "Carrier section close reported an error.",
+                status == 0 ? null : $"NTSTATUS 0x{status:X8}");
+            sectionHandle = IntPtr.Zero;
+        }
+
+        void CloseTarget()
+        {
+            if (hProcess == IntPtr.Zero)
+                return;
+            var closed = NativeMethods.CloseHandle(hProcess);
+            options.ReportProgress("hollow-target-close", "Close target handle", closed
+                    ? InjectionProgressStatus.Succeeded : InjectionProgressStatus.Warning,
+                closed ? "Target handle closed." : "Target handle close reported an error.");
+            hProcess = IntPtr.Zero;
+        }
+
         try
         {
             DirectSyscalls.Initialize();
 
+            options.ReportProgress("hollow-parse", "Read and validate payload image", InjectionProgressStatus.Running);
             byte[] payloadRaw;
             PeImage pe;
             try
@@ -65,36 +104,55 @@ internal sealed unsafe class DllHollowingInjector : InjectorBase
             }
             catch (BadImageFormatException ex)
             {
+                options.ReportProgress("hollow-parse", "Read and validate payload image", InjectionProgressStatus.Failed,
+                    "Payload is not a valid PE image.", ex.Message);
                 return InjectionResult.Fail(Method, dllPath, "Invalid PE image: " + ex.Message);
             }
+            options.ReportProgress("hollow-parse", "Read and validate payload image", InjectionProgressStatus.Succeeded,
+                $"Payload image validated ({pe.SizeOfImage:N0} bytes).");
 
+            options.ReportProgress("hollow-open", "Open target process", InjectionProgressStatus.Running);
             try
             {
                 hProcess = OpenRemoteProcess(pid, InjectionAccess);
             }
             catch (Exception ex)
             {
+                options.ReportProgress("hollow-open", "Open target process", InjectionProgressStatus.Failed, ex.Message);
                 return InjectionResult.Fail(Method, dllPath, "OpenProcess failed: " + ex.Message);
             }
+            options.ReportProgress("hollow-open", "Open target process", InjectionProgressStatus.Succeeded,
+                "Verified target handle opened.");
 
+            options.ReportProgress("hollow-carrier", "Find suitable system carrier", InjectionProgressStatus.Running,
+                "Searching loaded system DLLs for a sufficiently large image.");
             var candidate = FindSuitableSystemDll(pid, hProcess, (long)pe.SizeOfImage);
             var carrierPath = candidate.Path;
             if (carrierPath is null)
             {
-                NativeMethods.CloseHandle(hProcess);
-                hProcess = IntPtr.Zero;
+                options.ReportProgress("hollow-carrier", "Find suitable system carrier", InjectionProgressStatus.Failed,
+                    "No suitable loaded system DLL is large enough.");
+                CloseTarget();
                 return InjectionResult.Fail(Method, dllPath, "Could not find a suitable system DLL to hollow (need SizeOfImage >= payload).");
             }
+            options.ReportProgress("hollow-carrier", "Find suitable system carrier", InjectionProgressStatus.Succeeded,
+                $"Selected {Path.GetFileName(carrierPath)} ({candidate.SizeOfImage:N0} bytes).", carrierPath);
 
+            options.ReportProgress("hollow-section", "Create and map carrier image", InjectionProgressStatus.Running,
+                "Creating a SEC_IMAGE section from the selected system DLL.");
             fileHandle = NativeMethods.CreateFileW(carrierPath, GenericRead,
                 FileShareRead | FileShareWrite | FileShareDelete,
                 IntPtr.Zero, OpenExisting, FileAttributeNormal, IntPtr.Zero);
+            var carrierOpenError = fileHandle == IntPtr.Zero || fileHandle == invalidHandle
+                ? Win32Error.LastError()
+                : null;
             if (fileHandle == IntPtr.Zero || fileHandle == invalidHandle)
             {
                 fileHandle = IntPtr.Zero;
-                NativeMethods.CloseHandle(hProcess);
-                hProcess = IntPtr.Zero;
-                return InjectionResult.Fail(Method, dllPath, "Could not open carrier DLL for SEC_IMAGE section: " + Win32Error.LastError());
+                options.ReportProgress("hollow-section", "Create and map carrier image", InjectionProgressStatus.Failed,
+                    "Could not open the carrier DLL file.", carrierOpenError);
+                CloseTarget();
+                return InjectionResult.Fail(Method, dllPath, "Could not open carrier DLL for SEC_IMAGE section: " + carrierOpenError);
             }
 
             var createStatus = DirectSyscalls.NtCreateSection(
@@ -112,8 +170,9 @@ internal sealed unsafe class DllHollowingInjector : InjectorBase
             if (createStatus != 0)
             {
                 sectionHandle = IntPtr.Zero;
-                NativeMethods.CloseHandle(hProcess);
-                hProcess = IntPtr.Zero;
+                options.ReportProgress("hollow-section", "Create and map carrier image", InjectionProgressStatus.Failed,
+                    "NtCreateSection(SEC_IMAGE) failed.", $"NTSTATUS 0x{createStatus:X8}");
+                CloseTarget();
                 return InjectionResult.Fail(Method, dllPath, $"NtCreateSection(SEC_IMAGE) failed: 0x{createStatus:X8}");
             }
 
@@ -123,57 +182,72 @@ internal sealed unsafe class DllHollowingInjector : InjectorBase
                 IntPtr.Zero, out viewSize, ViewUnmap, 0, NativeConstants.PAGE_READONLY);
             if (mapStatus != 0 || remoteBase == IntPtr.Zero)
             {
-                DirectSyscalls.NtClose(sectionHandle);
-                sectionHandle = IntPtr.Zero;
-                NativeMethods.CloseHandle(hProcess);
-                hProcess = IntPtr.Zero;
+                options.ReportProgress("hollow-section", "Create and map carrier image", InjectionProgressStatus.Failed,
+                    "NtMapViewOfSection failed.", $"NTSTATUS 0x{mapStatus:X8}");
+                CloseSection();
+                CloseTarget();
                 return InjectionResult.Fail(Method, dllPath, $"NtMapViewOfSection failed: 0x{mapStatus:X8}");
             }
 
             if (viewSize.ToUInt64() < pe.SizeOfImage)
             {
-                DirectSyscalls.NtUnmapViewOfSection(hProcess, remoteBase);
-                DirectSyscalls.NtClose(sectionHandle);
-                NativeMethods.CloseHandle(hProcess);
-                hProcess = IntPtr.Zero;
-                sectionHandle = IntPtr.Zero;
+                options.ReportProgress("hollow-section", "Create and map carrier image", InjectionProgressStatus.Failed,
+                    "Carrier view is smaller than the payload image.", $"View 0x{viewSize.ToUInt64():X}; payload 0x{pe.SizeOfImage:X}");
+                UnmapCarrier();
+                CloseSection();
+                CloseTarget();
                 return InjectionResult.Fail(Method, dllPath,
                     $"Carrier image is too small (0x{viewSize.ToUInt64():X} < payload 0x{pe.SizeOfImage:X}).");
             }
+            options.ReportProgress("hollow-section", "Create and map carrier image", InjectionProgressStatus.Succeeded,
+                $"Carrier view mapped at 0x{remoteBase.ToInt64():X}; extent verified.");
 
             // Backup the carrier extent before any overwrite so a failed
             // attempt can restore it while the hijacked thread is suspended
             // (no thread may execute the view mid-restoration).
+            options.ReportProgress("hollow-backup", "Back up carrier bytes", InjectionProgressStatus.Running,
+                "Reading the payload-sized carrier extent before any overwrite.");
             var carrierBackup = new byte[pe.SizeOfImage];
             if (DirectSyscalls.NtReadVirtualMemory(hProcess, remoteBase, carrierBackup, out var cbr) != 0 ||
                 cbr.ToUInt64() != (ulong)carrierBackup.Length)
             {
-                DirectSyscalls.NtUnmapViewOfSection(hProcess, remoteBase);
-                DirectSyscalls.NtClose(sectionHandle);
-                NativeMethods.CloseHandle(hProcess);
-                hProcess = IntPtr.Zero;
-                sectionHandle = IntPtr.Zero;
+                options.ReportProgress("hollow-backup", "Back up carrier bytes", InjectionProgressStatus.Failed,
+                    "Could not read the full carrier extent.");
+                UnmapCarrier();
+                CloseSection();
+                CloseTarget();
                 return InjectionResult.Fail(Method, dllPath, "Could not back up the carrier view before hollowing.");
             }
+            options.ReportProgress("hollow-backup", "Back up carrier bytes", InjectionProgressStatus.Succeeded,
+                $"Captured {carrierBackup.Length:N0} bytes for rollback.");
 
+            options.ReportProgress("hollow-threads", "Enumerate target threads", InjectionProgressStatus.Running);
             var threads = ProcessManager.GetThreads(pid).OrderBy(t => t.ThreadId).ToList();
             if (threads.Count == 0)
             {
-                DirectSyscalls.NtUnmapViewOfSection(hProcess, remoteBase);
-                DirectSyscalls.NtClose(sectionHandle);
-                NativeMethods.CloseHandle(hProcess);
+                options.ReportProgress("hollow-threads", "Enumerate target threads", InjectionProgressStatus.Failed,
+                    "The target has no threads to hijack.");
+                UnmapCarrier();
+                CloseSection();
+                CloseTarget();
                 return InjectionResult.Fail(Method, dllPath, "The target has no threads to hijack.");
             }
+            options.ReportProgress("hollow-threads", "Enumerate target threads", InjectionProgressStatus.Succeeded,
+                $"Found {threads.Count} thread candidate(s).");
 
+            options.ReportProgress("hollow-thread-select", "Find a suitable hijack thread", InjectionProgressStatus.Running,
+                "Checking candidate contexts and stack margins.");
             foreach (var candidateThread in threads)
             {
                 if (!TrySuspendCandidate(candidateThread.ThreadId, out var hThread, out var acquireError))
                 {
                     if (acquireError is not null)
                     {
-                        DirectSyscalls.NtUnmapViewOfSection(hProcess, remoteBase);
-                        DirectSyscalls.NtClose(sectionHandle);
-                        NativeMethods.CloseHandle(hProcess);
+                        options.ReportProgress("hollow-thread-select", "Find a suitable hijack thread", InjectionProgressStatus.Failed,
+                            acquireError);
+                        UnmapCarrier();
+                        CloseSection();
+                        CloseTarget();
                         return InjectionResult.Fail(Method, dllPath, acquireError);
                     }
                     continue;
@@ -193,45 +267,50 @@ internal sealed unsafe class DllHollowingInjector : InjectorBase
                 {
                     // Mapping persists after handle close; keep the view mapped
                     // (success) or leave intact (hazard: thread may still run).
-                    DirectSyscalls.NtClose(sectionHandle);
-                    NativeMethods.CloseHandle(hProcess);
-                    hProcess = IntPtr.Zero;
-                    sectionHandle = IntPtr.Zero;
+                    options.ReportProgress("hollow-view-release", "Release carrier view", InjectionProgressStatus.Skipped,
+                        outcome.Success ? "Carrier view is the loaded module and remains mapped." :
+                        "Carrier view retained because the hijacked thread may still reference it.");
+                    CloseSection();
+                    CloseTarget();
                     return outcome;
                 }
 
                 // Clean failure: unmap so no corrupted view remains.
-                DirectSyscalls.NtUnmapViewOfSection(hProcess, remoteBase);
-                DirectSyscalls.NtClose(sectionHandle);
-                NativeMethods.CloseHandle(hProcess);
-                hProcess = IntPtr.Zero;
-                sectionHandle = IntPtr.Zero;
+                UnmapCarrier();
+                CloseSection();
+                CloseTarget();
                 return outcome;
             }
 
-            DirectSyscalls.NtUnmapViewOfSection(hProcess, remoteBase);
-            DirectSyscalls.NtClose(sectionHandle);
-            NativeMethods.CloseHandle(hProcess);
-            hProcess = IntPtr.Zero;
-            sectionHandle = IntPtr.Zero;
+            options.ReportProgress("hollow-thread-select", "Find a suitable hijack thread", InjectionProgressStatus.Failed,
+                "No hijackable thread with a known, sufficiently large stack was found.");
+            UnmapCarrier();
+            CloseSection();
+            CloseTarget();
             return InjectionResult.Fail(Method, dllPath,
                 "No hijackable thread with a known, sufficiently large stack was found.");
         }
         catch (Exception ex)
         {
             if (remoteBase != IntPtr.Zero && hProcess != IntPtr.Zero)
-                DirectSyscalls.NtUnmapViewOfSection(hProcess, remoteBase);
-            if (sectionHandle != IntPtr.Zero)
-                DirectSyscalls.NtClose(sectionHandle);
-            if (hProcess != IntPtr.Zero)
-                NativeMethods.CloseHandle(hProcess);
-            hProcess = IntPtr.Zero;
+                UnmapCarrier();
+            CloseSection();
+            CloseTarget();
             return InjectionResult.Fail(Method, dllPath, ex.Message);
         }
         finally
         {
             if (fileHandle != IntPtr.Zero && fileHandle != invalidHandle)
-                NativeMethods.CloseHandle(fileHandle);
+            {
+                options.ReportProgress("hollow-file-close", "Close carrier file handle", InjectionProgressStatus.Running);
+                var closed = NativeMethods.CloseHandle(fileHandle);
+                options.ReportProgress("hollow-file-close", "Close carrier file handle",
+                    closed ? InjectionProgressStatus.Succeeded : InjectionProgressStatus.Warning,
+                    closed ? "Carrier file handle closed." : "Carrier file handle close reported an error.");
+            }
+            else
+                options.ReportProgress("hollow-file-close", "Close carrier file handle", InjectionProgressStatus.Skipped,
+                    "Carrier file handle was already closed or not acquired.");
         }
     }
 
@@ -354,31 +433,51 @@ internal sealed unsafe class DllHollowingInjector : InjectorBase
         // to match the original image mapping.
         bool RestoreCarrier()
         {
+            options.ReportProgress("hollow-rollback-bytes", "Restore backed-up carrier bytes", InjectionProgressStatus.Running,
+                "Restoring the original carrier while the hijacked thread is suspended.");
             var rwBase = remoteBase;
             var rwSize = (UIntPtr)(uint)carrierBackup.Length;
             if (DirectSyscalls.NtProtectVirtualMemory(hProcess, ref rwBase, ref rwSize, NativeConstants.PAGE_READWRITE, out _) != 0)
+            {
+                options.ReportProgress("hollow-rollback-bytes", "Restore backed-up carrier bytes", InjectionProgressStatus.Failed,
+                    "Could not make the carrier view writable.");
                 return false;
+            }
             if (DirectSyscalls.NtWriteVirtualMemory(hProcess, remoteBase, carrierBackup, out var w) != 0 ||
                 w.ToUInt64() != (ulong)carrierBackup.Length)
+            {
+                options.ReportProgress("hollow-rollback-bytes", "Restore backed-up carrier bytes", InjectionProgressStatus.Failed,
+                    "Could not write the complete carrier backup.");
                 return false;
+            }
             try
             {
                 NativeMethods.FlushInstructionCacheChecked(hProcess, remoteBase, carrierBackup.Length);
             }
             catch
             {
+                options.ReportProgress("hollow-rollback-bytes", "Restore backed-up carrier bytes", InjectionProgressStatus.Failed,
+                    "Could not flush the restored carrier bytes.");
                 return false;
             }
             var roBase = remoteBase;
             var roSize = (UIntPtr)(uint)carrierBackup.Length;
             if (DirectSyscalls.NtProtectVirtualMemory(hProcess, ref roBase, ref roSize, NativeConstants.PAGE_READONLY, out _) != 0)
+            {
+                options.ReportProgress("hollow-rollback-bytes", "Restore backed-up carrier bytes", InjectionProgressStatus.Failed,
+                    "Could not restore read-only carrier protection.");
                 return false;
+            }
+            options.ReportProgress("hollow-rollback-bytes", "Restore backed-up carrier bytes", InjectionProgressStatus.Succeeded,
+                $"Restored {carrierBackup.Length:N0} original bytes and read-only protection.");
             return true;
         }
 
 
         try
         {
+            options.ReportProgress("hollow-context", "Capture and inspect thread context", InjectionProgressStatus.Running,
+                $"Checking thread {threadId} for a safe hijack context.");
             contextBuffer = CreateExtendedContext(out var contextPtr);
             if (contextBuffer == IntPtr.Zero)
             {
@@ -398,17 +497,27 @@ internal sealed unsafe class DllHollowingInjector : InjectorBase
 
             if (!TryGetTebInfo(hProcess, hThread, out var teb, out var stackLimit, out var lastError))
             {
+                options.ReportProgress("hollow-context", "Capture and inspect thread context", InjectionProgressStatus.Skipped,
+                    $"Thread {threadId} stack information could not be verified.");
                 Release();
                 return null;
             }
 
             if (originalRsp <= stackLimit || originalRsp - stackLimit < MinimumStackMargin)
             {
+                options.ReportProgress("hollow-context", "Capture and inspect thread context", InjectionProgressStatus.Skipped,
+                    $"Thread {threadId} does not have enough verified stack margin.");
                 Release();
                 return null;
             }
+            options.ReportProgress("hollow-context", "Capture and inspect thread context", InjectionProgressStatus.Succeeded,
+                $"Thread {threadId} has a usable stack and saved context.");
+            options.ReportProgress("hollow-thread-select", "Find a suitable hijack thread", InjectionProgressStatus.Succeeded,
+                $"Thread {threadId} has a restorable context and sufficient stack margin.");
 
             // ---- Reflective map into the file-backed view ----
+            options.ReportProgress("hollow-layout", "Prepare payload for carrier view", InjectionProgressStatus.Running,
+                "Applying relocations and validating TLS and unwind metadata.");
             var image = ReflectiveMapper.BuildMappedImage(pe);
             var delta = (long)remoteBase.ToInt64() - (long)pe.ImageBase;
             if (!ReflectiveMapper.TryApplyRelocations(pe, image, delta, out var relocError))
@@ -429,7 +538,11 @@ internal sealed unsafe class DllHollowingInjector : InjectorBase
                 Release();
                 return InjectionResult.Fail(Method, dllPath, excError ?? "Exception directory validation failed.");
             }
+            options.ReportProgress("hollow-layout", "Prepare payload for carrier view", InjectionProgressStatus.Succeeded,
+                $"Relocations applied; {callbacks.Count} TLS callback(s) and {exceptionCount} unwind entry/entries validated.");
 
+            options.ReportProgress("hollow-imports", "Resolve payload imports", InjectionProgressStatus.Running,
+                "Resolving imported modules and symbols in the target.");
             var imports = ReflectiveMapper.ResolveImports(pe, image, pid, hProcess, options.TimeoutMs, dependencies,
                 name => RemoteLoadLibrary(hProcess, pid, name, options.TimeoutMs));
             if (!imports.Ok)
@@ -445,20 +558,27 @@ internal sealed unsafe class DllHollowingInjector : InjectorBase
                 ReleaseDependencies(hProcess, pid, dependencies, options.TimeoutMs);
                 return InjectionResult.Fail(Method, dllPath, imports.Error ?? "Import resolution failed.");
             }
+            options.ReportProgress("hollow-imports", "Resolve payload imports", InjectionProgressStatus.Succeeded,
+                $"Payload imports resolved; {dependencies.Count} dependency reference(s) acquired.");
 
             // The carrier view is mapped read-only: make the payload extent
             // writable BEFORE writing (a direct NtWrite cannot span guarded
             // pages, and may fail or partially write them).
+            options.ReportProgress("hollow-write", "Write and protect payload image", InjectionProgressStatus.Running);
             MakeImageWritable(hProcess, remoteBase, checked((int)pe.SizeOfImage));
             carrierDirty = true;
             SyscallWrite(hProcess, remoteBase, image);
             NativeMethods.FlushInstructionCacheChecked(hProcess, remoteBase, image.Length);
             ProtectMappedImage(pe, hProcess, remoteBase);
+            options.ReportProgress("hollow-write", "Write and protect payload image", InjectionProgressStatus.Succeeded,
+                "Payload bytes were written and image page protections applied.");
 
             var entryPoint = pe.AddressOfEntryPoint == 0
                 ? IntPtr.Zero
                 : IntPtr.Add(remoteBase, (int)pe.AddressOfEntryPoint);
 
+            options.ReportProgress("hollow-init-prepare", "Prepare initialization stub", InjectionProgressStatus.Running,
+                "Resolving loader-lock functions and allocating stub slots.");
             var lockFunction = RemoteFunctionResolver.Resolve(pid, "ntdll.dll", "LdrLockLoaderLock");
             var unlockFunction = RemoteFunctionResolver.Resolve(pid, "ntdll.dll", "LdrUnlockLoaderLock");
             var sleepFunction = RemoteFunctionResolver.Resolve(pid, "kernel32.dll", "Sleep");
@@ -508,6 +628,8 @@ internal sealed unsafe class DllHollowingInjector : InjectorBase
             SyscallWrite(hProcess, codeRegion, initStub);
             NativeMethods.FlushInstructionCacheChecked(hProcess, codeRegion, initStub.Length);
             SyscallProtect(hProcess, codeRegion, initStub.Length, NativeConstants.PAGE_EXECUTE_READ);
+            options.ReportProgress("hollow-init-prepare", "Prepare initialization stub", InjectionProgressStatus.Succeeded,
+                "Separate result data and executable stub regions are ready.");
 
             ctx->Rip = (ulong)stubAddress.ToInt64();
             if (DirectSyscalls.NtSetContextThread(hThread, (IntPtr)ctx) != 0)
@@ -535,6 +657,8 @@ internal sealed unsafe class DllHollowingInjector : InjectorBase
                     "ResumeThread failed after redirect; original context restored BUT carrier rollback failed; the view may be corrupted.");
             }
 
+            options.ReportProgress("hollow-init-wait", "Wait for initialization stub", InjectionProgressStatus.Running,
+                "Running TLS callbacks and DllMain on the hijacked thread.");
             if (!WaitForDone(hProcess, doneAddress, resultAddress, options.TimeoutMs, out var initResult, out var resultReadable))
             {
                 // Timeout: thread may still execute stub/view. Retain everything.
@@ -542,11 +666,18 @@ internal sealed unsafe class DllHollowingInjector : InjectorBase
                 return InjectionResult.Fail(Method, dllPath,
                     "The hijacked thread did not finish initialization; stub and mapped view were left intact and the thread may still be running.");
             }
+            options.ReportProgress("hollow-init-wait", "Wait for initialization stub", InjectionProgressStatus.Succeeded,
+                "Initialization stub signaled completion; its result is checked separately.");
 
+            options.ReportProgress("hollow-init-result", "Verify initialization result", InjectionProgressStatus.Running);
+            options.ReportProgress("hollow-thread-restore", "Restore original thread state", InjectionProgressStatus.Running,
+                "Suspending the parked thread so its original context can be restored.");
             if (DirectSyscalls.NtSuspendThread(hThread, out _) != 0)
             {
                 // Cannot confirm suspension: thread may still execute stub.
                 initHazard = true;
+                options.ReportProgress("hollow-thread-restore", "Restore original thread state", InjectionProgressStatus.Failed,
+                    "Could not confirm suspension of the parked thread.");
                 return InjectionResult.Fail(Method, dllPath,
                     "Could not re-suspend the hijacked thread to restore its state; stub and view left intact.");
             }
@@ -559,6 +690,8 @@ internal sealed unsafe class DllHollowingInjector : InjectorBase
             {
                 initHazard = true;
                 leaveSuspended = true;
+                options.ReportProgress("hollow-init-result", "Verify initialization result", InjectionProgressStatus.Failed,
+                    "Initialization result could not be read; the thread remains suspended with the view intact.");
                 return InjectionResult.Fail(Method, dllPath,
                     "The init result could not be read; the thread was left suspended in the stub with the view intact.");
             }
@@ -567,6 +700,8 @@ internal sealed unsafe class DllHollowingInjector : InjectorBase
             {
                 initHazard = true;
                 leaveSuspended = true;
+                options.ReportProgress("hollow-init-result", "Verify initialization result", InjectionProgressStatus.Failed,
+                    "Loader lock could not be released; thread and mapped view were retained.");
                 return InjectionResult.Fail(Method, dllPath,
                     "The target loader lock could not be released; the thread was left suspended in the stub (it may own the lock) with the view intact. " +
                     "This is fail-closed: resuming its original context under a held loader lock would deadlock future loader activity, so the target process should be restarted.");
@@ -629,16 +764,24 @@ internal sealed unsafe class DllHollowingInjector : InjectorBase
 
             // Thread no longer executes the stub: safe to release both regions.
             FreeStubRegions(hProcess, ref dataRegion, ref codeRegion);
+            options.ReportProgress("hollow-thread-restore", "Restore original thread state", InjectionProgressStatus.Succeeded,
+                "Original context restored and the target thread resumed.");
 
             // Rollback outcomes were restored in the suspended window above;
             // report them now that the thread runs the restored carrier again.
             if (rollbackNote is not null)
+            {
+                options.ReportProgress("hollow-init-result", "Verify initialization result", InjectionProgressStatus.Failed,
+                    "Initialization did not succeed; carrier rollback completed.", rollbackNote);
                 return InjectionResult.Fail(Method, dllPath, rollbackNote);
+            }
 
             switch (initResult)
             {
                 case 1:
                     // Authoritative base is the mapped view, not a DllMain boolean.
+                    options.ReportProgress("hollow-init-result", "Verify initialization result", InjectionProgressStatus.Succeeded,
+                        $"Payload initialized at 0x{remoteBase.ToInt64():X}.");
                     var ok = InjectionResult.Ok(Method, dllPath, remoteBase, threadId);
                     if (!lastErrorRestored)
                         ok.Warning = "The target TEB LastErrorValue could not be restored.";
@@ -650,9 +793,13 @@ internal sealed unsafe class DllHollowingInjector : InjectorBase
                     return InjectionResult.Fail(Method, dllPath, "Internal error: rollback outcome reached the post-resume switch.");
                 case 5:
                     initHazard = true;
+                    options.ReportProgress("hollow-init-result", "Verify initialization result", InjectionProgressStatus.Failed,
+                        "Initialization rollback left a live function table; mapped view retained.");
                     return InjectionResult.Fail(Method, dllPath, "DllMain returned FALSE and RtlDeleteFunctionTable failed; the mapped view was left intact.");
                 default:
                     initHazard = true;
+                    options.ReportProgress("hollow-init-result", "Verify initialization result", InjectionProgressStatus.Failed,
+                        $"Unexpected initialization result {initResult}; mapped view retained.");
                     return InjectionResult.Fail(Method, dllPath, $"Image initialization returned an unexpected result ({initResult}); the mapped view was left intact.");
             }
         }
@@ -688,7 +835,19 @@ internal sealed unsafe class DllHollowingInjector : InjectorBase
                 Release();
             // Free both regions only when no thread can execute them.
             if (!redirected && !leaveSuspended && !initHazard)
+            {
+                options.ReportProgress("hollow-stub-cleanup", "Release initialization stub regions", InjectionProgressStatus.Running,
+                    "Releasing temporary data and executable regions after thread recovery.");
                 FreeStubRegions(hProcess, ref dataRegion, ref codeRegion);
+                var fullyReleased = dataRegion == IntPtr.Zero && codeRegion == IntPtr.Zero;
+                options.ReportProgress("hollow-stub-cleanup", "Release initialization stub regions",
+                    fullyReleased ? InjectionProgressStatus.Succeeded : InjectionProgressStatus.Warning,
+                    fullyReleased ? "Temporary initialization regions were released." :
+                    "One or more regions remain queued for cleanup.");
+            }
+            else
+                options.ReportProgress("hollow-stub-cleanup", "Release initialization stub regions", InjectionProgressStatus.Skipped,
+                    "Stub regions were retained because the hijacked thread may still reference them.");
             if (contextBuffer != IntPtr.Zero)
                 NativeMemory.AlignedFree((void*)contextBuffer);
         }

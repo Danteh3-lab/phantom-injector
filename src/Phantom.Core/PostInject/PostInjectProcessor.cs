@@ -30,21 +30,53 @@ public static class PostInjectProcessor
     public static string? Apply(uint pid, IntPtr moduleBase, InjectionOptions options)
     {
         if (moduleBase == IntPtr.Zero)
+        {
+            ReportConfiguredSteps(options, "Module base is unknown.");
             return "post-inject skipped: module base unknown.";
+        }
 
+        options.ReportProgress("postinject-access", "Open post-inject access", InjectionProgressStatus.Running,
+            "Verifying access before changing the mapped image or loader lists.");
         var preflight = TargetPreflight.Check(pid, Access);
         if (preflight.ProbeError is not null)
+        {
+            options.ReportProgress("postinject-access", "Open post-inject access", InjectionProgressStatus.Failed, preflight.ProbeError);
+            ReportConfiguredSteps(options, preflight.ProbeError);
             return "post-inject failed: " + preflight.ProbeError;
+        }
         if (!preflight.Opened)
+        {
+            var detail = $"NtOpenProcess - {NtStatus.Describe(preflight.OpenStatus)}";
+            options.ReportProgress("postinject-access", "Open post-inject access", InjectionProgressStatus.Failed, detail);
+            ReportConfiguredSteps(options, detail);
             return $"post-inject failed: NtOpenProcess - {NtStatus.Describe(preflight.OpenStatus)}";
+        }
         if (!preflight.RightsQueried)
+        {
+            var detail = $"Handle rights could not be verified ({NtStatus.Describe(preflight.QueryStatus)}).";
+            options.ReportProgress("postinject-access", "Open post-inject access", InjectionProgressStatus.Failed, detail);
+            ReportConfiguredSteps(options, detail);
             return $"post-inject failed: handle rights could not be verified ({NtStatus.Describe(preflight.QueryStatus)}).";
+        }
         if (preflight.Missing.Length > 0)
+        {
+            var detail = "Required process rights are missing: " + string.Join(", ", preflight.Missing);
+            options.ReportProgress("postinject-access", "Open post-inject access", InjectionProgressStatus.Failed, detail);
+            ReportConfiguredSteps(options, detail);
             return $"post-inject failed: required process rights are missing ({string.Join(", ", preflight.Missing)}).";
+        }
 
         using var target = preflight.Target;
         if (target is null)
+        {
+            options.ReportProgress("postinject-access", "Open post-inject access", InjectionProgressStatus.Failed,
+                "Target process identity could not be retained.");
+            ReportConfiguredSteps(options, "Target process identity could not be retained.");
             return "post-inject failed: target process identity could not be retained.";
+        }
+
+        options.ReportProgress("postinject-access", "Open post-inject access", InjectionProgressStatus.Succeeded,
+            "Target access and identity verified.");
 
         using var targetScope = target.EnterScope();
         return Apply(target, moduleBase, options);
@@ -53,31 +85,56 @@ public static class PostInjectProcessor
     internal static string? Apply(TargetProcessIdentity target, IntPtr moduleBase, InjectionOptions options)
     {
         if (moduleBase == IntPtr.Zero)
+        {
+            ReportConfiguredSteps(options, "Module base is unknown.");
             return "post-inject skipped: module base unknown.";
+        }
 
         IntPtr hProcess;
         {
+            options.ReportProgress("postinject-access", "Open post-inject access", InjectionProgressStatus.Running,
+                "Opening a verified handle for post-inject work.");
             try
             {
                 hProcess = target.OpenVerifiedHandle(Access);
             }
             catch (Exception ex)
             {
+                options.ReportProgress("postinject-access", "Open post-inject access", InjectionProgressStatus.Failed, ex.Message);
+                ReportConfiguredSteps(options, ex.Message);
                 return "post-inject failed: " + ex.Message;
             }
         }
 
         try
         {
+            options.ReportProgress("postinject-access", "Open post-inject access", InjectionProgressStatus.Succeeded,
+                "Verified target handle opened for post-inject work.");
             var failures = new List<string>();
             EraseOutcome? eraseOutcome = null;
 
             if (options.ErasePeHeaders)
             {
+                options.ReportProgress("postinject-erase", "Erase PE headers", InjectionProgressStatus.Running,
+                    "Saving the original header page before attempting a verified zeroing operation.");
                 eraseOutcome = EraseHeaders(hProcess, moduleBase);
                 if (!eraseOutcome.Value.Succeeded)
+                {
                     failures.Add("erase PE headers (" + eraseOutcome.Value.Failure + ")");
+                    options.ReportProgress("postinject-erase", "Erase PE headers",
+                        eraseOutcome.Value.CanContinueWithHide ? InjectionProgressStatus.Warning : InjectionProgressStatus.Failed,
+                        eraseOutcome.Value.CanContinueWithHide
+                            ? "Header erase did not complete; rollback and protections were verified, so hiding can continue."
+                            : "Header erase failed and rollback or protection recovery was not verified.",
+                        eraseOutcome.Value.Failure);
+                }
+                else
+                    options.ReportProgress("postinject-erase", "Erase PE headers", InjectionProgressStatus.Succeeded,
+                        "Header page was zeroed and verified; original protection restored.");
             }
+            else
+                options.ReportProgress("postinject-erase", "Erase PE headers", InjectionProgressStatus.Skipped,
+                    "Erase PE was not requested.");
 
             if (options.HideModule)
             {
@@ -90,9 +147,13 @@ public static class PostInjectProcessor
                     if (unsafeErase.ProtectionRestoreFailed)
                         reasons.Add("original page protection restoration failed");
                     failures.Add("hide module skipped because " + string.Join(" and ", reasons) + ".");
+                    options.ReportProgress("postinject-hide", "Hide module", InjectionProgressStatus.Skipped,
+                        "Skipped because header recovery was not verified.", string.Join(" and ", reasons));
                 }
                 else
                 {
+                    options.ReportProgress("postinject-hide", "Hide module", InjectionProgressStatus.Running,
+                        "Unlinking the module under the target loader lock.");
                     // Post-inject steps must never turn a successful injection into a
                     // top-level error; convert any failure into a warning.
                     try
@@ -100,19 +161,30 @@ public static class PostInjectProcessor
                         if (!LoaderLockUnlink.TryUnlink(target.Pid, hProcess, moduleBase, out var hideError, out var hashNote))
                         {
                             failures.Add("hide module (" + (hideError ?? "failed") + ")");
+                            options.ReportProgress("postinject-hide", "Hide module", InjectionProgressStatus.Failed,
+                                hideError ?? "Loader-list unlink failed.");
                         }
                         else if (hashNote is not null)
                         {
                             // Lists unlinked; hash-table cloaking skipped — warning only.
                             failures.Add("hide module hash (" + hashNote + ")");
+                            options.ReportProgress("postinject-hide", "Hide module", InjectionProgressStatus.Warning,
+                                "Loader lists were unlinked; hash-table unlink was skipped.", hashNote);
                         }
+                        else
+                            options.ReportProgress("postinject-hide", "Hide module", InjectionProgressStatus.Succeeded,
+                                "Module was unlinked from the target loader lists.");
                     }
                     catch (Exception ex)
                     {
                         failures.Add("hide module (" + ex.Message + ")");
+                        options.ReportProgress("postinject-hide", "Hide module", InjectionProgressStatus.Failed, ex.Message);
                     }
                 }
             }
+            else
+                options.ReportProgress("postinject-hide", "Hide module", InjectionProgressStatus.Skipped,
+                    "Hide Module was not requested.");
 
             return failures.Count == 0 ? null : "post-inject failed: " + string.Join(", ", failures);
         }
@@ -120,6 +192,16 @@ public static class PostInjectProcessor
         {
             NativeMethods.CloseHandle(hProcess);
         }
+    }
+
+    private static void ReportConfiguredSteps(InjectionOptions options, string details)
+    {
+        options.ReportProgress("postinject-erase", "Erase PE headers", InjectionProgressStatus.Skipped,
+            options.ErasePeHeaders ? "Skipped because post-inject access or module base was unavailable." :
+            "Erase PE was not requested.", options.ErasePeHeaders ? details : null);
+        options.ReportProgress("postinject-hide", "Hide module", InjectionProgressStatus.Skipped,
+            options.HideModule ? "Skipped because post-inject access or module base was unavailable." :
+            "Hide Module was not requested.", options.HideModule ? details : null);
     }
 
     private static EraseOutcome EraseHeaders(IntPtr hProcess, IntPtr moduleBase)

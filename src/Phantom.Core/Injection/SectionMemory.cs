@@ -40,7 +40,8 @@ internal static class SectionMemory
     internal sealed class CleanupScope : IDisposable
     {
         private readonly CleanupScope? _previous;
-        private readonly List<string> _failures = new();
+        private readonly List<string> _currentFailures = new();
+        private readonly List<string> _priorFailures = new();
         private bool _finalized;
         private string? _failureMessage;
 
@@ -57,21 +58,55 @@ internal static class SectionMemory
         {
             get
             {
-                if (!_finalized)
-                {
-                    _failures.AddRange(RetryPendingViews(Id));
-                    _failureMessage = _failures.Count == 0
-                        ? null
-                        : "Remote memory cleanup failed: " + string.Join("; ", _failures);
-                    _finalized = true;
-                }
-
+                FinalizeCleanup();
                 return _failureMessage;
             }
         }
 
+        internal string? CurrentFailureMessage
+        {
+            get
+            {
+                FinalizeCleanup();
+                return _currentFailures.Count == 0
+                    ? null
+                    : "Current operation cleanup failed: " + string.Join("; ", _currentFailures);
+            }
+        }
+
+        internal string? PriorFailureMessage
+        {
+            get
+            {
+                FinalizeCleanup();
+                return _priorFailures.Count == 0
+                    ? null
+                    : "Prior pending cleanup remains unresolved: " + string.Join("; ", _priorFailures);
+            }
+        }
+
         internal void Record(FreeResult result, IntPtr address)
-            => _failures.Add(result.Describe(address));
+            => _currentFailures.Add(result.Describe(address));
+
+        private void FinalizeCleanup()
+        {
+            if (_finalized)
+                return;
+
+            foreach (var message in RetryPendingViews(Id))
+            {
+                if (message.StartsWith("Prior pending cleanup", StringComparison.Ordinal))
+                    _priorFailures.Add(message);
+                else
+                    _currentFailures.Add(message);
+            }
+
+            var failures = _currentFailures.Concat(_priorFailures).ToArray();
+            _failureMessage = failures.Length == 0
+                ? null
+                : "Remote memory cleanup failed: " + string.Join("; ", failures);
+            _finalized = true;
+        }
 
         public void Dispose()
         {

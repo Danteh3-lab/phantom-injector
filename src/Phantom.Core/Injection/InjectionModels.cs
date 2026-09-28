@@ -28,6 +28,121 @@ public sealed class InjectionOptions
     public bool UnloadAfterLoad { get; set; }
 
     public int TimeoutMs { get; set; } = 10_000;
+
+    /// <summary>
+    /// Receives structured stage updates while an injection is running. Observer
+    /// exceptions are ignored so reporting can never interrupt target work.
+    /// </summary>
+    public Action<InjectionProgressEvent>? ProgressChanged { get; set; }
+
+    internal void ReportProgress(string stageId, string name, InjectionProgressStatus status,
+        string? details = null, string? technicalDetails = null)
+    {
+        var update = new InjectionProgressEvent(stageId, name, status, details, technicalDetails);
+        var session = InjectionProgressSession.Current;
+        if (session is not null && session.Uses(this))
+        {
+            session.Report(update);
+            return;
+        }
+
+        try { ProgressChanged?.Invoke(update); }
+        catch { /* Progress observers must not affect injection. */ }
+    }
+}
+
+public enum InjectionProgressStatus
+{
+    Pending,
+    Running,
+    Succeeded,
+    Failed,
+    Warning,
+    Skipped
+}
+
+/// <summary>A method-independent progress update with an expandable detail payload.</summary>
+public sealed record InjectionProgressEvent(
+    string StageId,
+    string Name,
+    InjectionProgressStatus Status,
+    string? Details = null,
+    string? TechnicalDetails = null);
+
+/// <summary>
+/// Tracks stage starts and closes any stage left active when an injector exits
+/// early. Events are delivered synchronously and observer errors are contained.
+/// </summary>
+internal sealed class InjectionProgressSession
+{
+    private static readonly AsyncLocal<InjectionProgressSession?> Ambient = new();
+    private readonly InjectionOptions _options;
+    private readonly List<InjectionProgressEvent> _active = new();
+
+    private InjectionProgressSession(InjectionOptions options) => _options = options;
+
+    internal static InjectionProgressSession? Current => Ambient.Value;
+    internal bool Uses(InjectionOptions options) => ReferenceEquals(_options, options);
+
+    internal void Report(InjectionProgressEvent update)
+    {
+        if (update.Status == InjectionProgressStatus.Running)
+        {
+            _active.RemoveAll(stage => stage.StageId == update.StageId);
+            _active.Add(update);
+        }
+        else
+        {
+            _active.RemoveAll(stage => stage.StageId == update.StageId);
+        }
+
+        Publish(update);
+    }
+
+    internal static InjectionResult Run(InjectionOptions options, Func<InjectionResult> operation)
+    {
+        var previous = Ambient.Value;
+        var session = new InjectionProgressSession(options);
+        Ambient.Value = session;
+        try
+        {
+            var result = operation();
+            session.Complete(result.Success, result.Error);
+            return result;
+        }
+        catch (Exception ex)
+        {
+            session.Complete(false, ex.Message);
+            throw;
+        }
+        finally
+        {
+            Ambient.Value = previous;
+        }
+    }
+
+    private void Complete(bool succeeded, string? failure)
+    {
+        var activeStages = _active.ToArray();
+        for (var index = 0; index < activeStages.Length; index++)
+        {
+            var active = activeStages[index];
+            var isFailureStage = !succeeded && index == activeStages.Length - 1;
+            Report(active with
+            {
+                Status = isFailureStage ? InjectionProgressStatus.Failed : InjectionProgressStatus.Warning,
+                Details = isFailureStage
+                    ? failure ?? active.Details
+                    : "No verified completion was reported for this stage."
+            });
+        }
+    }
+
+    private void Publish(InjectionProgressEvent update)
+    {
+        try { _options.ProgressChanged?.Invoke(update); }
+        catch { /* Progress observers must not affect injection. */ }
+    }
 }
 
 /// <summary>

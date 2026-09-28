@@ -33,6 +33,7 @@ internal sealed class ManualMapInjector : InjectorBase
 
         var dependencies = new List<IntPtr>();
         var dependencyCleanupHandled = false;
+        var dependencyProgressReported = false;
 
         // Releases already-acquired dependency references and records the
         // rollback outcome on the message, so a failure never claims cleanup
@@ -44,11 +45,19 @@ internal sealed class ManualMapInjector : InjectorBase
             // IAT (or code started during attach) can still use those modules.
             if (!dependencyHazard && !imageHazard && dependencies.Count > 0)
             {
+                options.ReportProgress("manual-dependencies", "Release loaded dependencies", InjectionProgressStatus.Running,
+                    "Rolling back dependency references acquired for this mapping.");
                 if (!ReleaseDependencies(hProcess, pid, dependencies, options.TimeoutMs, out var releaseError))
                 {
                     dependencyHazard = true;
+                    options.ReportProgress("manual-dependencies", "Release loaded dependencies", InjectionProgressStatus.Failed,
+                        "Dependency rollback failed.", releaseError);
                     message += " Dependency rollback also failed (" + releaseError + ").";
                 }
+                else
+                    options.ReportProgress("manual-dependencies", "Release loaded dependencies", InjectionProgressStatus.Succeeded,
+                        "Acquired dependency references were released.");
+                dependencyProgressReported = true;
             }
 
             dependencyCleanupHandled = true;
@@ -57,25 +66,38 @@ internal sealed class ManualMapInjector : InjectorBase
 
         try
         {
+            options.ReportProgress("manual-parse", "Read and validate PE image", InjectionProgressStatus.Running);
             var raw = File.ReadAllBytes(dllPath);
             var pe = new PeImage(raw);
+            options.ReportProgress("manual-parse", "Read and validate PE image", InjectionProgressStatus.Succeeded,
+                $"Image validated ({pe.SizeOfImage:N0} bytes).");
 
+            options.ReportProgress("manual-open", "Open target process", InjectionProgressStatus.Running);
             try
             {
                 hProcess = OpenRemoteProcess(pid, InjectionAccess);
             }
             catch (Exception ex)
             {
+                options.ReportProgress("manual-open", "Open target process", InjectionProgressStatus.Failed, ex.Message);
                 return InjectionResult.Fail(Method, dllPath, "OpenProcess failed: " + ex.Message);
             }
+            options.ReportProgress("manual-open", "Open target process", InjectionProgressStatus.Succeeded,
+                "Verified target handle opened.");
 
+            options.ReportProgress("manual-map", "Map payload image", InjectionProgressStatus.Running,
+                "Building the image and reserving target memory.");
             var image = BuildImage(pe);
 
             // Try to honour the preferred base first so relocations are unnecessary.
             remoteBase = TryAllocateAt(hProcess, (IntPtr)(long)pe.ImageBase, (int)pe.SizeOfImage);
             if (remoteBase == IntPtr.Zero)
                 remoteBase = AllocateRemote(hProcess, (int)pe.SizeOfImage, NativeConstants.PAGE_EXECUTE_READWRITE);
+            options.ReportProgress("manual-map", "Map payload image", InjectionProgressStatus.Succeeded,
+                $"Image view reserved at 0x{remoteBase.ToInt64():X}.");
 
+            options.ReportProgress("manual-layout", "Apply relocations and validate image metadata", InjectionProgressStatus.Running,
+                "Applying base relocations and checking TLS and unwind metadata.");
             var delta = (long)remoteBase.ToInt64() - (long)pe.ImageBase;
             if (!TryProcessRelocations(pe, image, delta, out var relocError))
                 return InjectionResult.Fail(Method, dllPath, relocError ?? "Relocation processing failed.");
@@ -85,9 +107,13 @@ internal sealed class ManualMapInjector : InjectorBase
             var callbacks = ParseTlsCallbacks(pe, image, remoteBase, out var tlsError);
             if (tlsError is not null)
                 return InjectionResult.Fail(Method, dllPath, tlsError);
+            options.ReportProgress("manual-layout", "Apply relocations and validate TLS", InjectionProgressStatus.Succeeded,
+                $"Relocations applied; {callbacks.Count} TLS callback(s) validated.");
 
             // The caller owns the dependency list so exceptions during import
             // resolution still leave the acquired references releasable.
+            options.ReportProgress("manual-imports", "Resolve image imports", InjectionProgressStatus.Running,
+                "Resolving imported modules and symbols in the target.");
             var imports = ResolveImports(pe, image, pid, hProcess, options.TimeoutMs, dependencies);
             if (!imports.Ok)
             {
@@ -95,11 +121,16 @@ internal sealed class ManualMapInjector : InjectorBase
                     dependencyHazard = true;
                 return FailMapping(imports.Error ?? "Import resolution failed.");
             }
+            options.ReportProgress("manual-imports", "Resolve image imports", InjectionProgressStatus.Succeeded,
+                $"Imports resolved; {dependencies.Count} dependency reference(s) acquired.");
 
+            options.ReportProgress("manual-write", "Write and protect image sections", InjectionProgressStatus.Running);
             WriteRemote(hProcess, remoteBase, image);
             NativeMethods.FlushInstructionCacheChecked(hProcess, remoteBase, (int)pe.SizeOfImage);
 
             ProtectSections(pe, hProcess, remoteBase);
+            options.ReportProgress("manual-write", "Write and protect image sections", InjectionProgressStatus.Succeeded,
+                "Image contents were written, instruction cache flushed, and page protections applied.");
 
             var entryPoint = pe.AddressOfEntryPoint == 0
                 ? IntPtr.Zero
@@ -108,6 +139,7 @@ internal sealed class ManualMapInjector : InjectorBase
             // x64 unwind metadata lives in the exception directory and must be
             // registered dynamically because the image is outside the loader.
             // Reject present-but-invalid or inconsistent directories.
+            options.ReportProgress("manual-unwind", "Validate unwind metadata", InjectionProgressStatus.Running);
             var exception = pe.Directory(PeImage.DirectoryException);
             if ((exception.VirtualAddress == 0) != (exception.Size == 0))
                 return FailMapping("The exception directory has inconsistent RVA/size fields.");
@@ -125,14 +157,21 @@ internal sealed class ManualMapInjector : InjectorBase
                 exceptionCount = (int)(exception.Size / 12);
                 exceptionTable = IntPtr.Add(remoteBase, (int)exception.VirtualAddress);
             }
+            options.ReportProgress("manual-unwind", "Validate unwind metadata", InjectionProgressStatus.Succeeded,
+                exceptionTable == IntPtr.Zero ? "No unwind table requires registration." :
+                $"Validated {exceptionCount} runtime function entries.");
 
             // Nothing to register or initialize.
             if (callbacks.Count == 0 && entryPoint == IntPtr.Zero && exceptionTable == IntPtr.Zero)
             {
+                options.ReportProgress("manual-initialize", "Initialize mapped image", InjectionProgressStatus.Skipped,
+                    "The image has no TLS callbacks, entry point, or unwind table to initialize.");
                 committed = true;
                 return InjectionResult.Ok(Method, dllPath, remoteBase);
             }
 
+            options.ReportProgress("manual-initialize", "Prepare image initialization", InjectionProgressStatus.Running,
+                "Resolving loader-lock and unwind registration functions.");
             var lockFunction = RemoteFunctionResolver.Resolve(pid, "ntdll.dll", "LdrLockLoaderLock");
             var unlockFunction = RemoteFunctionResolver.Resolve(pid, "ntdll.dll", "LdrUnlockLoaderLock");
             if (lockFunction == IntPtr.Zero || unlockFunction == IntPtr.Zero)
@@ -171,7 +210,11 @@ internal sealed class ManualMapInjector : InjectorBase
                 resultAddress, completionAddress, cookieAddress);
             WriteRemote(hProcess, stubAddress, initStub);
             NativeMethods.FlushInstructionCacheChecked(hProcess, stubAddress, initStub.Length);
+            options.ReportProgress("manual-initialize", "Prepare image initialization", InjectionProgressStatus.Succeeded,
+                "Initialization stub and result slots are ready.");
 
+            options.ReportProgress("manual-run-init", "Run image initialization", InjectionProgressStatus.Running,
+                "Running TLS callbacks and DllMain under the target loader lock.");
             var init = RunRemoteThread(hProcess, stubAddress, IntPtr.Zero, options.TimeoutMs);
             if (init.UnsafeToFree)
             {
@@ -201,6 +244,8 @@ internal sealed class ManualMapInjector : InjectorBase
             switch (initResult)
             {
                 case 1:
+                    options.ReportProgress("manual-run-init", "Run image initialization", InjectionProgressStatus.Succeeded,
+                        "Initialization succeeded and the loader lock was released.");
                     committed = true;
                     return InjectionResult.Ok(Method, dllPath, remoteBase, init.ThreadId);
 
@@ -238,6 +283,9 @@ internal sealed class ManualMapInjector : InjectorBase
         {
             if (hProcess != IntPtr.Zero)
             {
+                options.ReportProgress("manual-cleanup", "Release temporary mapping state", InjectionProgressStatus.Running,
+                    "Releasing mapper stubs and rolling back incomplete mappings when safe.");
+                var cleanupFailures = new List<string>();
                 // A failed mapping must release the dependency references it
                 // acquired; a committed one retains them (there is no unmap yet).
                 // Safety net for paths that threw instead of going through
@@ -245,8 +293,25 @@ internal sealed class ManualMapInjector : InjectorBase
                 if (!dependencyCleanupHandled && !dependencyHazard && !imageHazard &&
                     !committed && dependencies.Count > 0)
                 {
-                    if (!ReleaseDependencies(hProcess, pid, dependencies, options.TimeoutMs, out _))
+                    options.ReportProgress("manual-dependencies", "Release loaded dependencies", InjectionProgressStatus.Running,
+                        "Rolling back dependency references acquired for this mapping.");
+                    if (!ReleaseDependencies(hProcess, pid, dependencies, options.TimeoutMs, out var releaseError))
+                    {
                         dependencyHazard = true;
+                        options.ReportProgress("manual-dependencies", "Release loaded dependencies", InjectionProgressStatus.Failed,
+                            "Dependency rollback could not be verified.", releaseError);
+                        cleanupFailures.Add("Dependency rollback could not be verified: " + releaseError);
+                    }
+                    else
+                        options.ReportProgress("manual-dependencies", "Release loaded dependencies", InjectionProgressStatus.Succeeded,
+                            "Acquired dependency references were released.");
+                    dependencyProgressReported = true;
+                }
+                else if (dependencies.Count > 0 && (dependencyHazard || imageHazard) && !dependencyProgressReported)
+                {
+                    options.ReportProgress("manual-dependencies", "Release loaded dependencies", InjectionProgressStatus.Skipped,
+                        "Dependency references were retained because target execution state may still use them.");
+                    dependencyProgressReported = true;
                 }
 
                 // Retain the init stub only while the initialization thread may
@@ -254,12 +319,46 @@ internal sealed class ManualMapInjector : InjectorBase
                 // if unwind metadata or uncertain initialization state refers
                 // to it.
                 if (!initStubHazard)
-                    FreeRemote(hProcess, remoteStub);
+                {
+                    var stubCleanup = FreeRemote(hProcess, remoteStub);
+                    if (!stubCleanup.Succeeded)
+                        cleanupFailures.Add(stubCleanup.Describe(remoteStub));
+                }
 
                 if (!imageHazard && !committed)
-                    FreeRemote(hProcess, remoteBase);
+                {
+                    var imageCleanup = FreeRemote(hProcess, remoteBase);
+                    if (!imageCleanup.Succeeded)
+                        cleanupFailures.Add(imageCleanup.Describe(remoteBase));
+                }
 
-                NativeMethods.CloseHandle(hProcess);
+                var cleanupState = cleanupFailures.Count > 0
+                    ? InjectionProgressStatus.Failed
+                    : imageHazard || initStubHazard
+                        ? InjectionProgressStatus.Warning
+                        : InjectionProgressStatus.Succeeded;
+                var cleanupDetails = cleanupFailures.Count > 0
+                    ? "One or more current mapping resources could not be released."
+                    : imageHazard || initStubHazard
+                        ? "Remote resources were retained because target execution or loader state may still reference them."
+                        : committed
+                            ? "Temporary stubs released; the successfully mapped image remains loaded."
+                            : "Temporary mapping state was released.";
+                options.ReportProgress("manual-cleanup", "Release temporary mapping state", cleanupState,
+                    cleanupDetails, cleanupFailures.Count == 0 ? null : string.Join(Environment.NewLine, cleanupFailures));
+
+                options.ReportProgress("manual-close", "Close target handle", InjectionProgressStatus.Running);
+                var closed = NativeMethods.CloseHandle(hProcess);
+                options.ReportProgress("manual-close", "Close target handle",
+                    closed ? InjectionProgressStatus.Succeeded : InjectionProgressStatus.Warning,
+                    closed ? "Target handle closed." : "Target handle close reported an error.");
+            }
+            else
+            {
+                options.ReportProgress("manual-cleanup", "Release temporary mapping state", InjectionProgressStatus.Skipped,
+                    "No target mapping was created.");
+                options.ReportProgress("manual-close", "Close target handle", InjectionProgressStatus.Skipped,
+                    "No target handle was acquired.");
             }
         }
     }
