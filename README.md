@@ -51,7 +51,8 @@ is a clean-room re-implementation of the feature set described in its README.
   RVA is read from the original file, with forwarded and out-of-image RVAs
   rejected)
 - **Secure mode**: relaunch from a randomized `%TEMP%` path
-- **Un-inject** (`FreeLibrary` remotely)
+- **Loader-managed unload API** via remote `FreeLibrary` for `Standard`,
+  `LdrLoadDll`, and `ThreadHijack` injections when `Hide Module` was not requested
 - Process/thread/window picker, dark theme, settings persistence
 
 ## Requirements
@@ -108,11 +109,16 @@ For manual map + `Erase PE` + `Hide Module`, use an unsigned test DLL first.
   thread, and the reported base is the mapped view.
 - `ModuleStomping` – use when even a new image section stands out: an existing
   non-critical module is overwritten in place, so no new allocation appears at
-  all. Requirements: a loaded non-critical module with `SizeOfImage` and `.text`
-  capacity ≥ payload; same relocation/import/TLS rules as `ManualMap`. All other
-  target threads are suspended during the overwrite window. The host module is
-  byte-backed-up first: clean failures restore it, but a failed restore leaves
-  the target in a retain state (see below).
+  all. Requirements: a loaded non-critical module with `SizeOfImage` and
+  executable-section capacity ≥ payload; same relocation/import/TLS rules as
+  `ManualMap`. All other target threads are suspended during the overwrite
+  window. The host module is byte-backed-up first: clean failures restore it,
+  but a failed restore leaves the target in a retain state (see below).
+- **Un-inject** – `Uninjector.Unload` calls remote `FreeLibrary` only for
+  `Standard`, `LdrLoadDll`, and `ThreadHijack` injections, and only when
+  `Hide Module` was not requested. It rejects other methods before opening the
+  target or creating a remote thread. `ManualMap`, `DllHollowing`, and
+  `ModuleStomping` have no general manual-unload path.
 - `Erase PE` / `Hide Module` work on every method's reported base, including
   hollowed views and stomped modules.
 - **Retain states:** if the log reports a stub/view left mapped, a thread left

@@ -1,4 +1,5 @@
 using Phantom.Core.Native;
+using Phantom.Core.Injection;
 
 namespace Phantom.Core.PostInject;
 
@@ -14,8 +15,19 @@ public static class Uninjector
         NativeConstants.PROCESS_VM_WRITE |
         NativeConstants.PROCESS_VM_READ;
 
-    public static bool Unload(uint pid, IntPtr moduleBase)
+    /// <summary>
+    /// Calls FreeLibrary for a module loaded through the Windows loader.
+    /// Manual mappings, hollowed/stomped images, and requests that hid the
+    /// module from the loader lists are not supported.
+    /// </summary>
+    /// <param name="method">The injection method that produced <paramref name="moduleBase"/>.</param>
+    /// <param name="hideModuleRequested">Whether Hide Module was requested; true is rejected because unload after unlinking is unverified.</param>
+    public static bool Unload(uint pid, IntPtr moduleBase, InjectionMethod method, bool hideModuleRequested)
     {
+        if (moduleBase == IntPtr.Zero || hideModuleRequested ||
+            method is not (InjectionMethod.Standard or InjectionMethod.LdrLoadDll or InjectionMethod.ThreadHijack))
+            return false;
+
         IntPtr hProcess = IntPtr.Zero;
         try
         {
