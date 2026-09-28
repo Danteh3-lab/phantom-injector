@@ -22,10 +22,12 @@ internal static class SectionMemory
         public bool CleanupPending { get; set; }
         public int CleanupAttempts { get; set; }
         public int LastStatus { get; set; }
+        public long OriginScopeId { get; set; }
     }
 
     private static readonly Dictionary<ViewKey, SectionView> Sections = new();
     private static readonly object SectionLock = new();
+    private static long _nextCleanupScopeId;
 
     [ThreadStatic]
     private static CleanupScope? _activeCleanupScope;
@@ -45,8 +47,11 @@ internal static class SectionMemory
         internal CleanupScope()
         {
             _previous = _activeCleanupScope;
+            Id = Interlocked.Increment(ref _nextCleanupScopeId);
             _activeCleanupScope = this;
         }
+
+        internal long Id { get; }
 
         internal string? FailureMessage
         {
@@ -54,7 +59,7 @@ internal static class SectionMemory
             {
                 if (!_finalized)
                 {
-                    _failures.AddRange(RetryPendingViews());
+                    _failures.AddRange(RetryPendingViews(Id));
                     _failureMessage = _failures.Count == 0
                         ? null
                         : "Remote memory cleanup failed: " + string.Join("; ", _failures);
@@ -287,7 +292,8 @@ internal static class SectionMemory
                 SectionHandle = section,
                 CleanupPending = cleanupPending,
                 CleanupAttempts = cleanupAttempts,
-                LastStatus = lastStatus
+                LastStatus = lastStatus,
+                OriginScopeId = _activeCleanupScope?.Id ?? 0
             });
         }
     }
@@ -386,7 +392,7 @@ internal static class SectionMemory
         return 0;
     }
 
-    private static List<string> RetryPendingViews()
+    private static List<string> RetryPendingViews(long currentScopeId)
     {
         var failures = new List<string>();
         lock (SectionLock)
@@ -412,7 +418,10 @@ internal static class SectionMemory
                 var effect = view.IsUnmapped
                     ? "the view was unmapped but a tracking handle may remain open"
                     : "the target view may remain mapped";
-                var message = $"Remote section view 0x{key.Base:X} in process {key.Process.ProcessId} could not be released after {view.CleanupAttempts} attempts (NTSTATUS 0x{status:X8}); {effect}. It remains queued for a later retry.";
+                var origin = view.OriginScopeId == currentScopeId
+                    ? "Current operation cleanup remains unresolved for"
+                    : "Prior pending cleanup remains unresolved for";
+                var message = $"{origin} remote section view 0x{key.Base:X} in process {key.Process.ProcessId}: after {view.CleanupAttempts} attempts (NTSTATUS 0x{status:X8}), {effect}. It remains queued for a later retry.";
                 failures.Add(message);
                 System.Diagnostics.Trace.TraceError(message);
                 // A later scope gets a fresh bounded attempt budget. Keep the view and

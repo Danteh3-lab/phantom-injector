@@ -39,6 +39,9 @@ internal sealed unsafe class ModuleStompingInjector : InjectorBase
     private const int TebStackLimitOffset = 0x10;
     private const int TebLastErrorOffset = 0x68;
     private const uint ImageScnMemExecute = 0x20000000;
+    private const int InitialModuleCapacity = 128;
+    private const int MaxModuleCapacity = 16_384;
+    private const int MaxModuleEnumerationAttempts = 5;
 
     public override InjectionResult Inject(uint pid, string dllPath, InjectionOptions options)
     {
@@ -136,21 +139,67 @@ internal sealed unsafe class ModuleStompingInjector : InjectorBase
             return (IntPtr.Zero, null, string.Empty);
         }
 
-        var modules = new IntPtr[1024];
-        if (!NativeMethods.EnumProcessModulesEx(hProcess, modules, (uint)(modules.Length * IntPtr.Size), out var needed, NativeConstants.LIST_MODULES_ALL))
+        var modules = new IntPtr[InitialModuleCapacity];
+        var moduleCount = -1;
+        for (var attempt = 0; attempt < MaxModuleEnumerationAttempts; attempt++)
         {
-            failure = "Could not enumerate host modules to inspect executable-section capacity.";
+            var bufferBytes = checked((uint)(modules.Length * IntPtr.Size));
+            if (!NativeMethods.EnumProcessModulesEx(hProcess, modules, bufferBytes,
+                    out var needed, NativeConstants.LIST_MODULES_ALL))
+            {
+                failure = "Could not enumerate host modules to inspect executable-section capacity.";
+                return (IntPtr.Zero, null, string.Empty);
+            }
+
+            if (needed % (uint)IntPtr.Size != 0)
+            {
+                failure = "Host module enumeration returned an invalid byte count.";
+                return (IntPtr.Zero, null, string.Empty);
+            }
+
+            if (needed <= bufferBytes)
+            {
+                moduleCount = checked((int)(needed / (uint)IntPtr.Size));
+                break;
+            }
+
+            var requiredCapacity = ((ulong)needed + (uint)IntPtr.Size - 1) / (uint)IntPtr.Size;
+            if (requiredCapacity > MaxModuleCapacity)
+            {
+                failure = $"Host module enumeration requires {requiredCapacity} entries, exceeding the {MaxModuleCapacity}-module safety cap.";
+                return (IntPtr.Zero, null, string.Empty);
+            }
+
+            if (attempt == MaxModuleEnumerationAttempts - 1)
+            {
+                failure = $"Host module list did not stabilize within {MaxModuleEnumerationAttempts} enumeration attempts.";
+                return (IntPtr.Zero, null, string.Empty);
+            }
+
+            var doubledCapacity = (ulong)modules.Length * 2;
+            var nextCapacity = Math.Min((ulong)MaxModuleCapacity, Math.Max(requiredCapacity, doubledCapacity));
+            if (nextCapacity <= (ulong)modules.Length)
+            {
+                failure = "Host module enumeration could not grow its buffer safely.";
+                return (IntPtr.Zero, null, string.Empty);
+            }
+
+            modules = new IntPtr[checked((int)nextCapacity)];
+        }
+
+        if (moduleCount < 0 || moduleCount > modules.Length)
+        {
+            failure = "Host module enumeration did not produce a bounded module count.";
             return (IntPtr.Zero, null, string.Empty);
         }
 
-        var count = needed / (uint)IntPtr.Size;
         var sb = new System.Text.StringBuilder(260);
         var inspectedHosts = 0;
         var hasExecutableHost = false;
 
         (IntPtr Base, PeImage? Pe, string Name, uint Size) best = (IntPtr.Zero, null, string.Empty, uint.MaxValue);
 
-        for (var i = 0; i < count; i++)
+        for (var i = 0; i < moduleCount; i++)
         {
             if (NativeMethods.GetModuleBaseNameW(hProcess, modules[i], sb, 260) == 0)
                 continue;

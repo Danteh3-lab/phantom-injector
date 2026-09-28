@@ -9,6 +9,12 @@ namespace Phantom.Core.PostInject;
 /// </summary>
 public static class PostInjectProcessor
 {
+    private readonly record struct EraseOutcome(
+        bool Succeeded, string? Failure, bool RollbackFailed, bool ProtectionRestoreFailed)
+    {
+        public bool CanContinueWithHide => !RollbackFailed && !ProtectionRestoreFailed;
+    }
+
     private const uint Access =
         NativeConstants.PROCESS_QUERY_INFORMATION |
         NativeConstants.PROCESS_VM_OPERATION |
@@ -64,29 +70,47 @@ public static class PostInjectProcessor
         try
         {
             var failures = new List<string>();
+            EraseOutcome? eraseOutcome = null;
 
-            if (options.ErasePeHeaders && !EraseHeaders(hProcess, moduleBase, out var eraseError))
-                failures.Add("erase PE headers (" + eraseError + ")");
+            if (options.ErasePeHeaders)
+            {
+                eraseOutcome = EraseHeaders(hProcess, moduleBase);
+                if (!eraseOutcome.Value.Succeeded)
+                    failures.Add("erase PE headers (" + eraseOutcome.Value.Failure + ")");
+            }
 
             if (options.HideModule)
             {
-                // Post-inject steps must never turn a successful injection into a
-                // top-level error; convert any failure into a warning.
-                try
+                if (eraseOutcome.HasValue && !eraseOutcome.Value.CanContinueWithHide)
                 {
-                    if (!LoaderLockUnlink.TryUnlink(target.Pid, hProcess, moduleBase, out var hideError, out var hashNote))
-                    {
-                        failures.Add("hide module (" + (hideError ?? "failed") + ")");
-                    }
-                    else if (hashNote is not null)
-                    {
-                        // Lists unlinked; hash-table cloaking skipped — warning only.
-                        failures.Add("hide module hash (" + hashNote + ")");
-                    }
+                    var unsafeErase = eraseOutcome.Value;
+                    var reasons = new List<string>();
+                    if (unsafeErase.RollbackFailed)
+                        reasons.Add("header rollback failed");
+                    if (unsafeErase.ProtectionRestoreFailed)
+                        reasons.Add("original page protection restoration failed");
+                    failures.Add("hide module skipped because " + string.Join(" and ", reasons) + ".");
                 }
-                catch (Exception ex)
+                else
                 {
-                    failures.Add("hide module (" + ex.Message + ")");
+                    // Post-inject steps must never turn a successful injection into a
+                    // top-level error; convert any failure into a warning.
+                    try
+                    {
+                        if (!LoaderLockUnlink.TryUnlink(target.Pid, hProcess, moduleBase, out var hideError, out var hashNote))
+                        {
+                            failures.Add("hide module (" + (hideError ?? "failed") + ")");
+                        }
+                        else if (hashNote is not null)
+                        {
+                            // Lists unlinked; hash-table cloaking skipped — warning only.
+                            failures.Add("hide module hash (" + hashNote + ")");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        failures.Add("hide module (" + ex.Message + ")");
+                    }
                 }
             }
 
@@ -98,7 +122,7 @@ public static class PostInjectProcessor
         }
     }
 
-    private static bool EraseHeaders(IntPtr hProcess, IntPtr moduleBase, out string error)
+    private static EraseOutcome EraseHeaders(IntPtr hProcess, IntPtr moduleBase)
     {
         const int size = 0x1000;
         var backup = new byte[size];
@@ -110,14 +134,15 @@ public static class PostInjectProcessor
         }
         catch (Exception ex)
         {
-            error = "could not capture the original 4096 bytes: " + ex.Message;
-            return false;
+            return new EraseOutcome(false, "could not capture the original 4096 bytes: " + ex.Message,
+                RollbackFailed: false, ProtectionRestoreFailed: false);
         }
 
         if (readStatus != 0 || bytesRead.ToUInt64() != (ulong)size)
         {
-            error = $"could not capture the original 4096 bytes (NTSTATUS 0x{readStatus:X8}, read {bytesRead.ToUInt64()}/{size} bytes)";
-            return false;
+            return new EraseOutcome(false,
+                $"could not capture the original 4096 bytes (NTSTATUS 0x{readStatus:X8}, read {bytesRead.ToUInt64()}/{size} bytes)",
+                RollbackFailed: false, ProtectionRestoreFailed: false);
         }
 
         var baseAddr = moduleBase;
@@ -131,14 +156,14 @@ public static class PostInjectProcessor
         }
         catch (Exception ex)
         {
-            error = "could not make headers writable: " + ex.Message;
-            return false;
+            return new EraseOutcome(false, "could not make headers writable: " + ex.Message,
+                RollbackFailed: false, ProtectionRestoreFailed: false);
         }
 
         if (protectStatus != 0)
         {
-            error = $"could not make headers writable (NTSTATUS 0x{protectStatus:X8})";
-            return false;
+            return new EraseOutcome(false, $"could not make headers writable (NTSTATUS 0x{protectStatus:X8})",
+                RollbackFailed: false, ProtectionRestoreFailed: false);
         }
 
         string? eraseFailure = null;
@@ -190,6 +215,8 @@ public static class PostInjectProcessor
             }
         }
 
+        var rollbackFailed = eraseFailure is not null && rollbackFailure is not null;
+        var protectionRestoreFailed = protectionFailure is not null;
         var failures = new List<string>();
         if (eraseFailure is not null)
         {
@@ -205,13 +232,9 @@ public static class PostInjectProcessor
                 : protectionFailure);
 
         if (failures.Count == 0)
-        {
-            error = string.Empty;
-            return true;
-        }
+            return new EraseOutcome(true, null, RollbackFailed: false, ProtectionRestoreFailed: false);
 
-        error = string.Join("; ", failures);
-        return false;
+        return new EraseOutcome(false, string.Join("; ", failures), rollbackFailed, protectionRestoreFailed);
     }
 
     private static string? TryRestoreHeaderBytes(IntPtr hProcess, IntPtr moduleBase, byte[] backup)
