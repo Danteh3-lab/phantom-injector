@@ -353,7 +353,7 @@ internal sealed unsafe class ModuleStompingInjector : InjectorBase
             || moduleName.Equals("winmmbase.dll", StringComparison.OrdinalIgnoreCase);
     }
 
-    private static InjectionResult? TryHijackAndStomp(
+    private InjectionResult? TryHijackAndStomp(
         uint pid,
         IntPtr hProcess,
         IntPtr hThread,
@@ -368,6 +368,7 @@ internal sealed unsafe class ModuleStompingInjector : InjectorBase
         out bool initStarted)
     {
         corrupted = false;
+        var restoreCorrupted = false;
         threadSelected = false;
         initStarted = false;
         var contextBuffer = IntPtr.Zero;
@@ -466,9 +467,6 @@ internal sealed unsafe class ModuleStompingInjector : InjectorBase
             return true;
         }
 
-        string RestoredOrCorrupt(bool restored, string restoredMsg, string corruptMsg)
-            => restored ? restoredMsg : corruptMsg;
-
         // Idempotent: safe to call before terminal returns and again from
         // finally (second call is a no-op). Returns false when a live swept
         // thread could not be verified resumed.
@@ -488,7 +486,7 @@ internal sealed unsafe class ModuleStompingInjector : InjectorBase
             ReleaseDependencies(hProcess, pid, dependencies, options.TimeoutMs);
             if (!restored)
             {
-                corrupted = true;
+                restoreCorrupted = true;
                 leaveSuspended = true;
                 retainAllSuspended = true;
                 return InjectionResult.Fail(Method, dllPath, corruptMsg +
@@ -927,6 +925,7 @@ internal sealed unsafe class ModuleStompingInjector : InjectorBase
         }
         finally
         {
+            corrupted |= restoreCorrupted;
             if (!leaveSuspended && !threadRunning && UndoRedirect())
                 Release();
             // On host-corruption retain, swept threads stay suspended too:

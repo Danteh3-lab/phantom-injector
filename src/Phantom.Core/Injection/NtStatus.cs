@@ -12,6 +12,7 @@ internal static class NtStatus
     public static string Name(int status) => (uint)status switch
     {
         0x00000000 => "SUCCESS",
+        0xC0000004 => "INFO_LENGTH_MISMATCH",
         0xC0000008 => "INVALID_HANDLE",
         0xC000000B => "INVALID_CID",
         0xC000000D => "INVALID_PARAMETER",

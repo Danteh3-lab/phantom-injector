@@ -355,7 +355,7 @@ internal sealed unsafe class DllHollowingInjector : InjectorBase
         return (bestPath, bestSize);
     }
 
-    private static InjectionResult? TryHijackMapAndInit(
+    private InjectionResult? TryHijackMapAndInit(
         uint pid,
         IntPtr hProcess,
         IntPtr hThread,
@@ -369,6 +369,7 @@ internal sealed unsafe class DllHollowingInjector : InjectorBase
         out bool initHazard)
     {
         initHazard = false;
+        var restoreHazard = false;
         if (viewSize < pe.SizeOfImage)
             return InjectionResult.Fail(Method, dllPath, "Carrier view is smaller than the payload image.");
         var contextBuffer = IntPtr.Zero;
@@ -402,9 +403,6 @@ internal sealed unsafe class DllHollowingInjector : InjectorBase
             return !redirected;
         }
 
-        string RestoredOrCorrupt(bool restored, string restoredMsg, string corruptMsg)
-            => restored ? restoredMsg : corruptMsg;
-
         // Failure exit while the hijack thread is suspended: restore first,
         // then resume. On restore failure nothing is resumed: the thread stays
         // suspended in the stub and the view is retained for restart.
@@ -414,7 +412,7 @@ internal sealed unsafe class DllHollowingInjector : InjectorBase
             ReleaseDependencies(hProcess, pid, dependencies, options.TimeoutMs);
             if (!restored)
             {
-                initHazard = true;
+                restoreHazard = true;
                 leaveSuspended = true;
                 return InjectionResult.Fail(Method, dllPath, corruptMsg +
                     " Nothing was resumed; the thread was left suspended with the view intact. The target process should be restarted.");
@@ -831,6 +829,7 @@ internal sealed unsafe class DllHollowingInjector : InjectorBase
         }
         finally
         {
+            initHazard |= restoreHazard;
             if (!leaveSuspended && !threadRunning && UndoRedirect())
                 Release();
             // Free both regions only when no thread can execute them.

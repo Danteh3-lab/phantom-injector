@@ -695,10 +695,13 @@ internal static class DirectSyscalls
     public static int NtQueryGrantedAccess(IntPtr handle, out uint grantedAccess)
     {
         grantedAccess = 0;
-        var buf = Marshal.AllocHGlobal(64);
+        // PUBLIC_OBJECT_BASIC_INFORMATION is 14 ULONGs. Windows requires
+        // this exact length for ObjectBasicInformation on some builds.
+        const int basicInformationSize = 14 * sizeof(uint);
+        var buf = Marshal.AllocHGlobal(basicInformationSize);
         try
         {
-            var status = NtQueryObject(handle, 0, buf, 64, out _);
+            var status = NtQueryObject(handle, 0, buf, basicInformationSize, out _);
             if (status != 0)
                 return status;
             grantedAccess = (uint)Marshal.ReadInt32(buf, 4);
