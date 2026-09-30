@@ -1,15 +1,16 @@
 # PhantomDumper
 
 A separate x64 Windows C++17 diagnostic DLL for development processes you own
-or are authorized to inspect. Version 0.5 adds a versioned offset catalog to
-module metadata, logging, the synchronous lifecycle, memory inspection, pattern
-scanning and known structure inspection. It does not yet discover layouts or
-signatures automatically, dump binaries, or generate an SDK.
+or are authorized to inspect. Version 0.6 completes the six planned components
+with deterministic JSON and C++17 offset-catalog export, capture metadata and
+end-to-end verification. The host supplies known signatures, layouts and build
+identities; this project does not automatically discover them or generate a game SDK.
 
 ## Build and test
 
 Install Visual Studio 2022's Desktop development with C++ workload and CMake
-3.20 or newer. From the repository root:
+3.20 or newer. Tests also require Python 3 (standard library only) on PATH for
+independent JSON verification. From the repository root:
 
 ```powershell
 cmake -S PhantomDumper -B PhantomDumper/build -A x64 -DBUILD_TESTING=ON
@@ -426,7 +427,121 @@ Portable tests cover RVA capture/rebasing, image and field boundaries, overflow,
 changed versions/images/layouts, typed lookup separation, failed insertion
 recovery, metadata copies and the combined record limit. Windows tests use real
 Tool Help host-module metadata for an RVA round-trip and resolve a known field to
-its native typed-inspection address. JSON/C++ serialization remains phase #6.
+its native typed-inspection address. ExportManager serializes this catalog in phase #6.
+
+## ExportManager (phase #6)
+
+`include/phantom/ExportManager.hpp` renders an OffsetManager catalog and optional
+host-supplied capture metadata to JSON or a standalone C++17 header. It reads
+only catalog metadata, without inspecting target memory. Native consumers link
+against `PhantomDumperCore`; the DLL's C lifecycle exports continue to take module
+snapshots. Integrate known signatures/layouts and catalog construction explicitly
+in the host's diagnostic workflow.
+
+```cpp
+#include "phantom/ExportManager.hpp"
+
+phantom::ExportMetadata capture{"run-42", "2026-01-01T00:00:00Z"};
+auto json = phantom::ExportManager::Json(offsets, capture);
+auto header = phantom::ExportManager::CppHeader(offsets, capture);
+// Existing parent directories, explicit caller-selected destinations:
+phantom::ExportManager::WriteJson(L"C:/diagnostics/offsets.json", offsets, capture);
+phantom::ExportManager::WriteCppHeader(L"C:/diagnostics/offsets.hpp", offsets, capture);
+```
+
+Identical catalog/metadata inputs produce identical bytes, independent of
+insertion order or global numeric locale. Each record array is sorted by its
+key's unsigned UTF-8 byte order. No current timestamp is added implicitly.
+Optional `capture_id` and `created_at_utc` default to empty strings and are each
+limited to 256 bytes. Time metadata is supplied by the host and stored as text,
+without parsing or authentication. All exported text must be valid UTF-8;
+malformed, overlong, surrogate or out-of-range encodings throw
+`std::invalid_argument`. Metadata can contain embedded NUL/control characters;
+escaping preserves them. OffsetManager's own identifier constraints still apply.
+
+JSON schema version 1 includes:
+
+| Member | Content |
+| --- | --- |
+| `schema_version` / `generator` | `1` and `PhantomDumper` |
+| `metadata` | Capture ID and caller-supplied UTC text |
+| `game` | Catalog game name and build identity |
+| `modules` | Key, module name/build ID, image size, RVA and span width |
+| `fields` | Key, structure name/extent, field name, offset, type and width |
+
+Offsets/sizes are exact decimal JSON integers; empty arrays are valid. Quotes,
+backslashes and controls are escaped while valid Unicode remains UTF-8. These
+are relative offset records rather than captured addresses or field values;
+runtime bases, paths and process contents are not part of the catalog format.
+Schema/build metadata should accompany records when downstream code chooses
+which catalog to use.
+
+The generated header requires only `<array>`, `<cstdint>` and `<string_view>`.
+Namespace `phantom_dump` contains `schema_version`, generator/game/capture string
+views, `FieldKind`, `ModuleOffsetRecord`, `FieldOffsetRecord`, and inline constexpr
+`modules`/`fields` arrays. Keys remain strings, so punctuation, Unicode, keywords
+and similarly spelled keys cannot create invalid/colliding C++ identifiers.
+Fixed three-digit octal byte escapes make the file ASCII, avoid greedy hex
+escapes and preserve input bytes regardless of compiler source encoding.
+Explicit string-view lengths preserve embedded NULs. Array entries retain
+record kind, type and width rather than merging RVAs with structure offsets.
+Use one generated catalog definition per program in this fixed namespace.
+
+```cpp
+#include "offsets.hpp"
+static_assert(phantom_dump::schema_version == 1);
+void InspectCatalogMetadata() {
+    // Select the appropriate catalog/build before using these constants.
+    for (const auto& item : phantom_dump::modules) {
+        // item.key, item.module_name, item.module_build_id, item.rva, item.width
+    }
+}
+```
+
+File methods render/validate completely before opening the destination, write
+in binary mode, check write/flush/close, and return with no open handle. Invalid
+serialization leaves an existing destination untouched. A successful call
+creates or overwrites/truncates its explicit destination; parents are not
+created. I/O failures throw `std::ios_base::failure` and may leave a truncated or
+partial file. Writes and the JSON/header pair are not transactional: publish
+from a caller-controlled staging directory when a consistent pair is required.
+Allocation exceptions can propagate. Coordinate concurrent catalog mutation,
+access and publication in the host.
+
+Exporting does not upgrade offset confidence or validate object lifetime,
+readability, image bytes or application semantics. Game/image build identifiers
+retain OffsetManager's host-supplied semantics. Header constants cannot enforce
+runtime version checks; the consuming host must select/verify the current build
+and coordinate lifetimes before using resolved addresses.
+
+### End-to-end fixture and verification
+
+`tests/ExportFixture.cpp` demonstrates the complete memory/pattern/structure/
+offset/export path using an owned development fixture. On Windows it uses real
+Tool Help module metadata and current-process memory reads against the fixture
+in the host executable. Portable CI substitutes a bounded owned-buffer backend
+and synthetic module metadata. It locates a wildcard signature across small
+chunks, inspects known fields, records all seven supported scalar field types,
+resolves a field address, and writes JSON/header catalogs plus empty catalogs.
+
+CMake runs this producer before compiling standalone consumers of the actual
+generated headers. Compile-time assertions verify types, widths, records,
+sorting, Unicode/NUL metadata and empty arrays. CTest repeats the workflow and
+then Python's standard JSON parser checks schema members, duplicates, identities,
+types, integer spans and escaped-byte/Unicode round trips. Export unit tests
+also cover ordering, locale independence, UTF-8 boundaries/errors, Unicode file
+paths, exact saved bytes, overwrite behavior and I/O failures.
+
+After a Windows build, the fixture can be run explicitly in an existing/new
+caller-owned output directory (it creates that test directory):
+
+```powershell
+PhantomDumper/build/Release/PhantomDumperExportFixture.exe C:/diagnostics/fixture
+```
+
+This executable is an owned-fixture reference host, not a configurable game
+scanner. Its synthetic capture/build labels are test data. Production hosts
+provide their own signatures, layouts, identities, synchronization and paths.
 
 ## Components and follow-up PRs
 
@@ -437,6 +552,7 @@ its native typed-inspection address. JSON/C++ serialization remains phase #6.
 - `PatternScanner`: known signature parsing and bounded wildcard matching.
 - `StructureInspector`: validated known layouts, pointer checks and typed field reads.
 - `OffsetManager`: versioned module RVAs and structure field offset records.
+- `ExportManager`: deterministic JSON/C++ catalogs with capture and build metadata.
 - `Exports`/`dllmain`: explicit C API with exception containment and minimal entry point.
 
 Core tests cover formatting, large addresses, log escaping, initialization
@@ -445,4 +561,5 @@ Windows smoke tests validate real module bases, Unicode output paths, named
 exports and repeated load/start/snapshot/stop/unload cycles. They do not test
 anti-cheat behavior or Phantom's injection methods.
 
-The final planned phase adds JSON/C++ ExportManager and end-to-end coverage.
+All six planned components are implemented. Further work can be driven by the
+host integration requirements and findings from development-process tests.
