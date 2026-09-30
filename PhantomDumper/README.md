@@ -1,10 +1,10 @@
 # PhantomDumper
 
 A separate x64 Windows C++17 diagnostic DLL for development processes you own
-or are authorized to inspect. Version 0.3 adds signature parsing and bounded
-pattern scanning to the foundation's module metadata, logging, synchronous
-lifecycle and read-only current-process memory inspection. It does not yet
-discover signatures automatically, dump binaries, or generate an SDK.
+or are authorized to inspect. Version 0.4 adds known structure layouts, typed
+field inspection and pointer readability checks to module metadata, logging,
+the synchronous lifecycle, memory inspection and pattern scanning. It does not
+yet discover layouts/signatures automatically, dump binaries, or generate an SDK.
 
 ## Build and test
 
@@ -243,6 +243,101 @@ comparison with a whole-buffer reference across 200 deterministic randomized
 fixtures. Windows page tests also verify a native wildcard match across chunk
 and read/write-to-read-only boundaries and skipping a stable guard page.
 
+## StructureInspector (phase #4)
+
+`include/phantom/StructureInspector.hpp` inspects a layout supplied by the host
+or obtained from authorized reverse engineering. It remains a C++ component
+linked through `PhantomDumperCore`, with every source read going through
+MemoryInspector. There are no new C exports or automatic inspection on DLL load.
+
+For example, a development host with a known standard-layout structure can
+derive field offsets directly from its source:
+
+```cpp
+#include "phantom/StructureInspector.hpp"
+#include <cstddef>
+#include <cstdint>
+
+struct DevPlayer {
+    std::int32_t health;
+    float x, y, z;
+    std::uint64_t next_address; // x64 pointer bits for this fixture.
+};
+DevPlayer player{100, 1.0f, 2.0f, 3.0f, 0};
+phantom::StructureLayout layout("DevPlayer", sizeof(DevPlayer), {
+    {"health", offsetof(DevPlayer, health), phantom::FieldType::int32},
+    {"x", offsetof(DevPlayer, x), phantom::FieldType::float32},
+    {"y", offsetof(DevPlayer, y), phantom::FieldType::float32},
+    {"z", offsetof(DevPlayer, z), phantom::FieldType::float32},
+    {"next", offsetof(DevPlayer, next_address), phantom::FieldType::pointer64}
+});
+phantom::MemoryInspector memory;
+phantom::StructureInspector structures(memory);
+auto result = structures.Inspect(reinterpret_cast<std::uintptr_t>(&player), layout);
+if (result.fields[0].error.status == phantom::MemoryStatus::ok) {
+    auto health = std::get<std::int32_t>(result.fields[0].value);
+    // Use health as an observed value; validate game-specific semantics separately.
+}
+auto range_check = structures.CheckPointer(reinterpret_cast<std::uintptr_t>(&player), sizeof(player));
+// range_check.status == ok is snapshot readability, not lifetime/type validity.
+```
+
+Layouts own their structure/field names and descriptors. Construction validates
+nonempty, NUL-free names of at most 128 bytes, unique field names, a size from
+1 byte to 16 MiB, 1 to 256 fields, supported types, and every field's complete
+width fitting inside the declared extent. Invalid definitions throw
+`std::invalid_argument` before any target access. Overlapping fields with distinct
+names are permitted for unions or aliases; unaligned fields are supported.
+
+| `FieldType` | Width | `FieldValue` alternative |
+| --- | --- | --- |
+| `int32` / `uint32` | 4 bytes | `std::int32_t` / `std::uint32_t` |
+| `int64` / `uint64` | 8 bytes | `std::int64_t` / `std::uint64_t` |
+| `float32` / `float64` | 4 / 8 bytes | `float` / `double` |
+| `pointer64` | 8 bytes | `PointerValue` with the stored 64-bit address bits |
+
+Values use native byte order with IEEE-754 floats, matching the x64 Windows
+baseline. The portable core/tests use their host's native order. No source
+buffer is cast to a structure or dereferenced for decoding: scalars are copied
+from owned byte buffers. Float NaNs, integer extremes and null pointer values
+are preserved; no health range, object identity, pointee type or application
+invariant is inferred. Coordinate vectors can be defined as separate float
+fields. Strings, arrays, nested structures and automatic pointer chains are
+outside this phase.
+
+`Inspect` validates the full base interval for null/overflow before reading, then
+copies each declared field independently in definition order. It does not read
+padding or require the whole structure to be readable. Each `FieldResult` owns
+its descriptor, runtime field address, copied bytes, typed value and MemoryError.
+Only a complete successful field read is decoded; every failure leaves the value
+as `std::monostate`, even if the OS reported a full transfer count. Partial raw
+bytes and native error codes remain available. Later fields are still attempted.
+`StructureStatus::ok` means all declared fields were read successfully;
+`memory_error` means at least one failed and the aggregate error identifies the
+first failure in definition order. Invalid base intervals return
+`invalid_address` with no fields or target access. A moved-from empty layout is
+rejected as `invalid_layout`. Allocation/unexpected C++ exceptions can propagate.
+
+`CheckPointer(address, size = 1)` performs bounded region metadata checks only.
+It rejects null, empty, overflowed or over-16-MiB intervals and requires all
+covered pages to be committed/readable according to MemoryInspector. Guard,
+no-access, execute-only, reserved and free pages fail. Query errors and the
+default 65,536-region enumeration limit are preserved. It copies no target
+bytes, follows no stored pointers, and cannot guarantee a later read succeeds.
+Pointer fields are simply values; explicitly call CheckPointer on a stored
+address and an intended extent when that check is useful.
+
+These are best-effort field observations rather than an atomic object snapshot.
+The host must coordinate writers/lifetimes for coherent structures. A readable
+address may hold a different allocation by the next operation, and successful
+field reads do not establish that the supplied layout matches the object.
+
+Portable tests cover invalid/bounded layouts, all scalar types, unaligned reads,
+pointer bits, numeric extremes, NaNs, padding, cross-region partial fields,
+continued inspection after errors and native query/copy failures. Windows page
+tests verify typed reads across RW/RO boundaries, partial guard-boundary fields,
+and pointer checks without clearing a stable guard page.
+
 ## Components and follow-up PRs
 
 - `ModuleResolver`: Windows module metadata snapshot.
@@ -250,6 +345,7 @@ and read/write-to-read-only boundaries and skipping a stable guard page.
 - `Runtime`: transactional initialization, serialized snapshots, stop/restart.
 - `MemoryInspector`: bounded region enumeration and read-only copies.
 - `PatternScanner`: known signature parsing and bounded wildcard matching.
+- `StructureInspector`: validated known layouts, pointer checks and typed field reads.
 - `Exports`/`dllmain`: explicit C API with exception containment and minimal entry point.
 
 Core tests cover formatting, large addresses, log escaping, initialization
@@ -258,5 +354,4 @@ Windows smoke tests validate real module bases, Unicode output paths, named
 exports and repeated load/start/snapshot/stop/unload cycles. They do not test
 anti-cheat behavior or Phantom's injection methods.
 
-Later PRs can add StructureInspector, OffsetManager and JSON/C++ ExportManager
-independently.
+Later PRs can add OffsetManager and JSON/C++ ExportManager independently.
