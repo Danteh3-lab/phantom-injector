@@ -1,8 +1,10 @@
 #include "phantom/MemoryInspector.hpp"
 #include "phantom/PatternScanner.hpp"
 #include "phantom/StructureInspector.hpp"
+#include "phantom/OffsetManager.hpp"
 #include <windows.h>
 #include <cstring>
+#include <algorithm>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
@@ -81,6 +83,17 @@ int main() {
         Check(structures.CheckPointer(base + page - 4, 8).status == phantom::MemoryStatus::ok &&
             structures.CheckPointer(base + page * 2 - 4, 8).status == phantom::MemoryStatus::unreadable,
             "native pointer checks distinguish readable and guarded spans");
+        phantom::OffsetManager offsets({"native-tests", "fixture-v1"});
+        const auto modules = phantom::EnumerateModules();
+        const auto host_base = reinterpret_cast<std::uintptr_t>(GetModuleHandleW(nullptr));
+        const auto host = std::find_if(modules.begin(), modules.end(), [host_base](const auto& module) { return module.base == host_base; });
+        Check(host != modules.end(), "native host module metadata available");
+        offsets.AddModuleAddress("host_byte", *host, host->base + 1, 1, "host-fixture-image");
+        Check(offsets.ResolveModule("host_byte", *host, offsets.version(), "host-fixture-image").address == host->base + 1,
+            "native Tool Help module metadata supports RVA round-trip");
+        offsets.AddField("page.boundary", readable_layout, "boundary");
+        Check(offsets.ResolveField("page.boundary", base + page - 4, readable_layout, offsets.version()).address == base + page - 4,
+            "native known layout field resolves to typed inspection address");
         const auto guard = inspector.Read(base + page * 2 - 8, 16);
         Check(guard.error.status == MemoryStatus::unreadable && guard.bytes.size() == 8 &&
             guard.error.address == base + page * 2, "guard stops read with prefix");

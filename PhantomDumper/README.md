@@ -1,10 +1,10 @@
 # PhantomDumper
 
 A separate x64 Windows C++17 diagnostic DLL for development processes you own
-or are authorized to inspect. Version 0.4 adds known structure layouts, typed
-field inspection and pointer readability checks to module metadata, logging,
-the synchronous lifecycle, memory inspection and pattern scanning. It does not
-yet discover layouts/signatures automatically, dump binaries, or generate an SDK.
+or are authorized to inspect. Version 0.5 adds a versioned offset catalog to
+module metadata, logging, the synchronous lifecycle, memory inspection, pattern
+scanning and known structure inspection. It does not yet discover layouts or
+signatures automatically, dump binaries, or generate an SDK.
 
 ## Build and test
 
@@ -338,6 +338,96 @@ continued inspection after errors and native query/copy failures. Windows page
 tests verify typed reads across RW/RO boundaries, partial guard-boundary fields,
 and pointer checks without clearing a stable guard page.
 
+## OffsetManager (phase #5)
+
+`include/phantom/OffsetManager.hpp` stores validated offset records for one
+game/build identity. It performs metadata validation and checked arithmetic,
+without querying or reading target memory. Native consumers link through
+`PhantomDumperCore`; existing C exports and DLL lifecycle behavior are unchanged.
+
+```cpp
+#include "phantom/OffsetManager.hpp"
+
+phantom::VersionInfo version{"development-game", "build-42"};
+phantom::OffsetManager offsets(version);
+// module is a ModuleInfo snapshot; candidate is a known address, such as a
+// validated PatternScanner match. The host supplies an image-specific build ID.
+offsets.AddModuleAddress("registry", module, candidate, 8, "engine-image-build-19");
+offsets.AddField("player.health", player_layout, "health");
+
+// Supply fresh module metadata, game identity and module build identity.
+auto module_address = offsets.ResolveModule("registry", current_module,
+    current_version, current_module_build_id);
+if (module_address.status == phantom::OffsetStatus::ok) {
+    // module_address.address == current_module.base + the recorded RVA.
+    // Check current readability with MemoryInspector before inspecting bytes.
+}
+auto field_address = offsets.ResolveField("player.health", current_player_base,
+    current_player_layout, current_version);
+```
+
+The two record types preserve different coordinate systems:
+
+| Record | Stored offset | Identity/bounds metadata |
+| --- | --- | --- |
+| `ModuleOffset` | 32-bit RVA from image base | Module name, image build ID, image size and inspected span width |
+| `FieldOffset` | Offset from structure base | Structure name/extent and the chosen field's name, offset and type |
+
+`AddModuleAddress` converts an absolute observation to an RVA. The nonnull image
+interval must not overflow; the address and its nonempty width must lie wholly
+inside that image. RVA zero and the final image byte are valid. Image RVAs are
+not disk file offsets. The catalog retains no observed runtime base or module
+path, allowing ASLR rebasing and deployment path changes. `AddField` copies a
+field from a validated StructureLayout; nonexistent fields are rejected. Field
+offset zero and distinct aliases are valid. Catalog keys are globally unique
+across both record types; typed lookups do not reinterpret one kind as the other.
+
+Every catalog has an immutable `VersionInfo` (game name plus build ID).
+`ResolveModule` requires an exact match for this game/build identity, module name,
+module build ID and image size, then checks the current image interval before
+rebasing the RVA. `ResolveField` requires the same game/build identity and a
+matching structure name/extent plus the selected field's name/offset/type, then
+checks the whole structure interval before adding the field offset. Other fields
+are not part of that record's comparison. Module names and build IDs compare
+exactly, including case. Construct a new catalog for a new game build.
+
+Version/build identifiers are **host-supplied labels or fingerprints**, not
+automatically computed or authenticated. Tool Help supplies names, bases and
+image sizes, but cannot establish the supplied build ID. The host should derive
+stable build IDs from its own build metadata or an appropriate image fingerprint
+and supply the current identity independently. Reusing an old ID on a changed
+image can defeat this check; matching sizes or labels alone do not prove bytes
+are unchanged. Records may represent unverified candidate addresses until the
+host establishes their meaning.
+
+| `OffsetStatus` | Meaning |
+| --- | --- |
+| `ok` | Metadata matched and arithmetic produced an address. |
+| `not_found` | No record of the requested kind has this key. |
+| `version_mismatch` | Game or game build identity differs. |
+| `module_mismatch` | Module name, image build ID or image size differs. |
+| `layout_mismatch` | Structure/selected-field metadata differs or the field is missing. |
+| `invalid_range` | Current module/structure base is null or its interval overflows. |
+
+Failed resolution returns address zero. Success guarantees neither readability,
+pointer lifetime nor object identity; use MemoryInspector/StructureInspector for
+subsequent observations and coordinate host lifetimes. No stale address fallback,
+pointer following, offset discovery or target writes are performed.
+
+All catalog keys and identity text must be nonempty, NUL-free and at most 128
+bytes. Invalid/duplicate insertions throw `std::invalid_argument` without adding
+a record. The combined module/field limit is 4,096 records; exhausting it throws
+`std::length_error` without overwrite or eviction. Const accessors expose records
+and root version metadata for later export. Allocation exceptions can propagate.
+Catalog copies own their metadata; additions can invalidate references to record
+elements. Callers must coordinate concurrent mutation/access.
+
+Portable tests cover RVA capture/rebasing, image and field boundaries, overflow,
+changed versions/images/layouts, typed lookup separation, failed insertion
+recovery, metadata copies and the combined record limit. Windows tests use real
+Tool Help host-module metadata for an RVA round-trip and resolve a known field to
+its native typed-inspection address. JSON/C++ serialization remains phase #6.
+
 ## Components and follow-up PRs
 
 - `ModuleResolver`: Windows module metadata snapshot.
@@ -346,6 +436,7 @@ and pointer checks without clearing a stable guard page.
 - `MemoryInspector`: bounded region enumeration and read-only copies.
 - `PatternScanner`: known signature parsing and bounded wildcard matching.
 - `StructureInspector`: validated known layouts, pointer checks and typed field reads.
+- `OffsetManager`: versioned module RVAs and structure field offset records.
 - `Exports`/`dllmain`: explicit C API with exception containment and minimal entry point.
 
 Core tests cover formatting, large addresses, log escaping, initialization
@@ -354,4 +445,4 @@ Windows smoke tests validate real module bases, Unicode output paths, named
 exports and repeated load/start/snapshot/stop/unload cycles. They do not test
 anti-cheat behavior or Phantom's injection methods.
 
-Later PRs can add OffsetManager and JSON/C++ ExportManager independently.
+The final planned phase adds JSON/C++ ExportManager and end-to-end coverage.
