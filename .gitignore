@@ -20,3 +20,6 @@ testdll/obj/
 ## OS
 Thumbs.db
 desktop.ini
+
+## Native diagnostic DLL build output
+PhantomDumper/build*/
