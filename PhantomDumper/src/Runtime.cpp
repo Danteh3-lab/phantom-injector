@@ -18,8 +18,11 @@ Status Runtime::Start(const std::filesystem::path& path) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (started_) return Status::invalid_state;
     if (path.empty()) return Status::invalid_argument;
-    // Copy before side effects; failed initialization remains retryable.
-    auto candidate = path;
+    // Resolve once before capture so later host working-directory changes cannot
+    // redirect subsequent snapshots. Resolution failures remain retryable.
+    std::filesystem::path candidate;
+    try { candidate = std::filesystem::absolute(path); }
+    catch (...) { return Status::log_error; }
     const auto result = Capture(candidate);
     if (result == Status::ok) {
         path_.swap(candidate);

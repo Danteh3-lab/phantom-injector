@@ -5,6 +5,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <locale>
 #include <stdexcept>
 #include <thread>
 
@@ -17,6 +18,18 @@ struct Fixture {
         ("phantom-core-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
     Fixture() { Check(std::filesystem::create_directory(directory), "create fixture directory"); }
     ~Fixture() { std::error_code error; std::filesystem::remove_all(directory, error); }
+};
+struct CurrentPathGuard {
+    std::filesystem::path original = std::filesystem::current_path();
+    ~CurrentPathGuard() { std::error_code error; std::filesystem::current_path(original, error); }
+};
+struct GlobalLocaleGuard {
+    std::locale original = std::locale();
+    ~GlobalLocaleGuard() { std::locale::global(original); }
+};
+struct GroupingPunct : std::numpunct<char> {
+    char do_thousands_sep() const override { return ','; }
+    std::string do_grouping() const override { return "\3"; }
 };
 std::string Read(const std::filesystem::path& path) {
     std::ifstream file(path, std::ios::binary);
@@ -38,6 +51,17 @@ int main() {
         Check(formatted.find("tab\\tline\\n\t0x1000\t0x20\tx\\r\\nforged\n") != std::string::npos,
             "log fields cannot inject rows");
         Check(phantom::FormatModules({}).find("modules=0\n") != std::string::npos, "empty snapshot formatting");
+
+        {
+            GlobalLocaleGuard locale_guard;
+            std::locale::global(std::locale(std::locale::classic(), new GroupingPunct));
+            std::vector<phantom::ModuleInfo> many(1000, {"module", "path", 0x123456789abcULL, 0x123456});
+            const auto locale_formatted = phantom::FormatModules(many);
+            Check(locale_formatted.find("modules=1000\n") != std::string::npos,
+                "module count ignores global grouping locale");
+            Check(locale_formatted.find("0x123456789abc\t0x123456\t") != std::string::npos,
+                "hex addresses and sizes ignore global grouping locale");
+        }
 
         using phantom::Status;
         std::atomic<int> calls{0};
@@ -87,6 +111,23 @@ int main() {
         Check(runtime.Snapshot() == Status::ok, "refresh retries after I/O recovery");
         Check(runtime.Stop() == Status::ok, "stop after refresh");
         Check(runtime.Snapshot() == Status::invalid_state, "snapshot after stop");
+        const auto directory_a = fixture.directory / "a";
+        const auto directory_b = fixture.directory / "b";
+        std::filesystem::create_directory(directory_a);
+        std::filesystem::create_directory(directory_b);
+        {
+            CurrentPathGuard cwd_guard;
+            std::filesystem::current_path(directory_a);
+            phantom::Runtime relative_runtime([&] { return modules; });
+            Check(relative_runtime.Start("relative.log") == Status::ok, "start resolves relative destination");
+            std::filesystem::current_path(directory_b);
+            Check(relative_runtime.Snapshot() == Status::ok, "snapshot survives host working-directory change");
+            Check(relative_runtime.Stop() == Status::ok, "stop relative destination runtime");
+        }
+        Check(Read(directory_a / "relative.log") == formatted + formatted,
+            "relative destination remains anchored to start directory");
+        Check(!std::filesystem::exists(directory_b / "relative.log"), "working-directory change does not redirect log");
+
         const auto next_log = fixture.directory / "next.log";
         Check(runtime.Start(next_log) == Status::ok, "restart at new path");
         Check(Read(next_log) == formatted, "restart uses new destination");

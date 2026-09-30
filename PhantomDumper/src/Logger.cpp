@@ -1,5 +1,6 @@
 #include "phantom/Logger.hpp"
 #include <fstream>
+#include <locale>
 #include <sstream>
 #include <stdexcept>
 
@@ -23,6 +24,7 @@ std::string Escape(const std::string& value) {
 
 std::string FormatModules(const std::vector<ModuleInfo>& modules) {
     std::ostringstream out;
+    out.imbue(std::locale::classic());
     out << "PhantomDumper v0.1 snapshot modules=" << modules.size() << '\n';
     out << "name\tbase_address\timage_size\tpath\n";
     for (const auto& module : modules) {
