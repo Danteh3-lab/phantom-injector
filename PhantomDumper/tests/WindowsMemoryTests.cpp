@@ -1,4 +1,5 @@
 #include "phantom/MemoryInspector.hpp"
+#include "phantom/PatternScanner.hpp"
 #include <windows.h>
 #include <iostream>
 #include <limits>
@@ -52,6 +53,15 @@ int main() {
         Check(read.error.status == MemoryStatus::ok && read.bytes.size() == 34, "cross RW/RO boundary read");
         for (std::size_t i = 0; i < read.bytes.size(); ++i)
             Check(read.bytes[i] == std::byte((page - 17 + i) & 0xff), "real copied content");
+        phantom::PatternScanner scanner(inspector);
+        phantom::ScanOptions options;
+        options.chunk_size = 3;
+        const auto scan = scanner.Scan(base + page - 16, 32, phantom::Pattern::Parse("FE FF ?? 01"), options);
+        Check(scan.status == phantom::ScanStatus::ok && scan.matches == std::vector<std::uintptr_t>{base + page - 2},
+            "native wildcard match crosses chunk and RW/RO region boundaries");
+        const auto skip = scanner.Scan(base + page * 2 - 8, 24, phantom::Pattern::Parse("FE FF ?"), options);
+        Check(skip.status == phantom::ScanStatus::ok && skip.matches.empty() && skip.bytes_read == 8 && skip.bytes_skipped == 16,
+            "native scan skips guard and cannot match across gap");
         const auto guard = inspector.Read(base + page * 2 - 8, 16);
         Check(guard.error.status == MemoryStatus::unreadable && guard.bytes.size() == 8 &&
             guard.error.address == base + page * 2, "guard stops read with prefix");
