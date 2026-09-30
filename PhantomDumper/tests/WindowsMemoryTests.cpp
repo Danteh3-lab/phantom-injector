@@ -1,6 +1,8 @@
 #include "phantom/MemoryInspector.hpp"
 #include "phantom/PatternScanner.hpp"
+#include "phantom/StructureInspector.hpp"
 #include <windows.h>
+#include <cstring>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
@@ -62,6 +64,23 @@ int main() {
         const auto skip = scanner.Scan(base + page * 2 - 8, 24, phantom::Pattern::Parse("FE FF ?"), options);
         Check(skip.status == phantom::ScanStatus::ok && skip.matches.empty() && skip.bytes_read == 8 && skip.bytes_skipped == 16,
             "native scan skips guard and cannot match across gap");
+        // Known development fixture schema: fields cross RW/RO pages and encounter guard.
+        const phantom::StructureLayout layout("PageFixture", 32,
+            {{"cross_boundary", 0, phantom::FieldType::uint64}, {"guarded", 16, phantom::FieldType::uint32}});
+        phantom::StructureInspector structures(inspector);
+        const auto inspected = structures.Inspect(base + page * 2 - 4, layout);
+        Check(inspected.status == phantom::StructureStatus::memory_error && inspected.fields[0].bytes.size() == 4 &&
+            std::holds_alternative<std::monostate>(inspected.fields[0].value) &&
+            inspected.fields[1].error.status == phantom::MemoryStatus::unreadable, "native partial typed field is not decoded");
+        const phantom::StructureLayout readable_layout("Readable", 8, {{"boundary", 0, phantom::FieldType::uint64}});
+        const auto typed = structures.Inspect(base + page - 4, readable_layout);
+        std::uint64_t expected = 0;
+        std::memcpy(&expected, bytes + page - 4, sizeof(expected));
+        Check(typed.status == phantom::StructureStatus::ok && std::get<std::uint64_t>(typed.fields[0].value) == expected,
+            "native typed field spans RW/RO boundary");
+        Check(structures.CheckPointer(base + page - 4, 8).status == phantom::MemoryStatus::ok &&
+            structures.CheckPointer(base + page * 2 - 4, 8).status == phantom::MemoryStatus::unreadable,
+            "native pointer checks distinguish readable and guarded spans");
         const auto guard = inspector.Read(base + page * 2 - 8, 16);
         Check(guard.error.status == MemoryStatus::unreadable && guard.bytes.size() == 8 &&
             guard.error.address == base + page * 2, "guard stops read with prefix");
