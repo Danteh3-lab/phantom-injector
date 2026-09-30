@@ -212,6 +212,14 @@ This produces `samples\TestDll\phantest.dll`. Its exported `PhantomHello` shows 
 message box and can be called from the injector's export feature; `DllMain` is
 intentionally silent to avoid running UI under the loader lock.
 
+## PhantomDumper
+
+The independent [PhantomDumper foundation](PhantomDumper/README.md) is an x64
+C++ diagnostic DLL with module enumeration, text logging, explicit lifecycle
+exports, CMake build instructions and tests. Loading it alone does not collect
+data; call `PhantomDumperStart`, `PhantomDumperSnapshot` and `PhantomDumperStop`
+outside the loader lock. Offset discovery and SDK generation are future work.
+
 ## Project layout
 
 ```

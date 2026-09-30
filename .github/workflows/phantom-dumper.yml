@@ -1,0 +1,26 @@
+name: PhantomDumper
+on:
+  push:
+    paths: ['PhantomDumper/**', '.github/workflows/phantom-dumper.yml']
+  pull_request:
+    paths: ['PhantomDumper/**', '.github/workflows/phantom-dumper.yml']
+permissions:
+  contents: read
+jobs:
+  windows:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        configuration: [Debug, Release]
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -S PhantomDumper -B PhantomDumper/build -A x64 -DBUILD_TESTING=ON
+      - run: cmake --build PhantomDumper/build --config ${{ matrix.configuration }}
+      - run: ctest --test-dir PhantomDumper/build -C ${{ matrix.configuration }} --output-on-failure
+  core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: cmake -S PhantomDumper -B PhantomDumper/build -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=ON
+      - run: cmake --build PhantomDumper/build
+      - run: ctest --test-dir PhantomDumper/build --output-on-failure
