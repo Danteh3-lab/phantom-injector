@@ -1,9 +1,10 @@
 # PhantomDumper
 
 A separate x64 Windows C++17 diagnostic DLL for development processes you own
-or are authorized to inspect. Version 0.2 adds bounded, read-only current-process
-memory inspection to the foundation's module metadata, logging, and synchronous
-lifecycle. It does not yet discover offsets, dump binaries, or generate an SDK.
+or are authorized to inspect. Version 0.3 adds signature parsing and bounded
+pattern scanning to the foundation's module metadata, logging, synchronous
+lifecycle and read-only current-process memory inspection. It does not yet
+discover signatures automatically, dump binaries, or generate an SDK.
 
 ## Build and test
 
@@ -159,12 +160,96 @@ protection boundaries, and cover guard preservation, no-access, execute-only,
 reserved/decommitted pages and invalid addresses. The backend is stateless; read
 buffers and results belong to the caller. No background work is introduced.
 
+## PatternScanner (phase #3)
+
+`include/phantom/PatternScanner.hpp` adds another C++ component linked through
+`PhantomDumperCore`. It consumes MemoryInspector results and never dereferences
+source addresses itself. No new C exports or automatic DLL lifecycle work are
+introduced. A signature must already be known; a match is a runtime address,
+not a validated structure, function or version-independent offset.
+
+```cpp
+#include "phantom/PatternScanner.hpp"
+
+phantom::MemoryInspector inspector;
+phantom::PatternScanner scanner(inspector);
+auto pattern = phantom::Pattern::Parse("48 8B ?? ?? 89");
+auto scan = scanner.Scan(module.base, module.image_size, pattern);
+if (scan.status == phantom::ScanStatus::ok) {
+    // scan.matches contains all observed matches in the readable portions.
+    // scan.bytes_skipped records bytes in inaccessible snapshot regions.
+} else {
+    // Incomplete scan: matches may contain earlier valid observations.
+    // For memory failures inspect scan.memory_error, including native_error.
+}
+```
+
+Parsing accepts ASCII hex pairs in either case and whole-byte wildcards `?` or
+`??`, separated by ASCII whitespace. Leading/trailing whitespace is allowed.
+Empty patterns, compact strings (`488B`), prefixes (`0x48`), nibble wildcards
+(`?F`/`F?`), invalid hex and punctuation are rejected with
+`std::invalid_argument`. Text is limited to 64 KiB and patterns to 4,096 bytes.
+All-wildcard patterns are valid and subject to the same output limit.
+
+Scans use `[address, address + size)` and reject overflow/nonempty null ranges.
+Matches are ascending, include overlaps and must fit entirely inside the
+requested range. The scanner first enumerates regions, then reads each readable
+portion in bounded chunks. Up to `pattern length - 1` copied bytes are retained
+so matches spanning chunk boundaries or adjacent readable regions are found
+once. Unreadable regions are skipped and clear the retained overlap: bytes on
+opposite sides of a gap cannot form a match. An enumeration or later read failure
+ends the scan with `memory_error`; matches wholly inside a copied prefix remain
+available. An inaccessible region skipped from the snapshot is distinct from a
+page that becomes inaccessible during a later copy, which ends the scan.
+
+`ScanOptions` bounds resource use:
+
+| Option | Default | Behavior |
+| --- | --- | --- |
+| `chunk_size` | 64 KiB | Read/window chunk; accepted range is 1 byte to 1 MiB. |
+| `max_scan_bytes` | 64 MiB | Reject larger intervals before any query/read. |
+| `max_matches` | 1,024 | Stop immediately at this many matches. |
+| `max_comparisons` | 67,108,864 | Stop before exceeding this number of fixed-byte comparisons. |
+| `max_regions` | 65,536 | Passed to MemoryInspector's bounded region walk. |
+
+Zero chunk/match/comparison/region limits are invalid options. For larger images,
+choose a smaller section/range or deliberately increase `max_scan_bytes` and the
+work budget. Chunk/window memory does not grow with the total scanned interval.
+Fixed-byte positions are precomputed so wildcard bytes require no comparisons;
+matching is otherwise a straightforward bounded search, not an optimized
+multi-pattern engine. Highly repetitive input or long signatures may exhaust the
+comparison budget. `bytes_read` counts fetched bytes, even if matching stops
+before processing the whole last chunk; `comparisons` counts actual comparisons.
+If a failed native read and a scanner limit coincide in its copied prefix, the
+native failure takes priority in the returned status.
+
+Only `ScanStatus::ok` indicates completion over readable snapshot portions.
+`match_limit` is conservative: reaching the cap stops immediately even if that
+match happens to be the last one. `work_limit` and `range_limit` identify the
+other scanner limits; region enumeration limits appear as `memory_error` with
+`MemoryStatus::limit_exceeded`. Do not interpret partial results as a full scan
+with no other matches. An empty scan succeeds without memory access after
+argument validation. Allocation/unexpected C++ exceptions can propagate.
+
+As with MemoryInspector, observations are best effort. Chunk overlap can combine
+bytes copied at different moments; host synchronization is required for a
+coherent scan. Neither matches nor skipped regions guarantee future accessibility
+or address identity. Pattern scanning does not resolve relative instructions,
+inspect structures, calculate RVAs or export results; those remain later phases.
+
+Portable tests cover malformed signatures, exact/wildcard/overlapping matches,
+chunk/region/range boundaries, gaps, resource limits, read/query failures and
+comparison with a whole-buffer reference across 200 deterministic randomized
+fixtures. Windows page tests also verify a native wildcard match across chunk
+and read/write-to-read-only boundaries and skipping a stable guard page.
+
 ## Components and follow-up PRs
 
 - `ModuleResolver`: Windows module metadata snapshot.
 - `Logger`: format and append a snapshot without retaining handles.
 - `Runtime`: transactional initialization, serialized snapshots, stop/restart.
 - `MemoryInspector`: bounded region enumeration and read-only copies.
+- `PatternScanner`: known signature parsing and bounded wildcard matching.
 - `Exports`/`dllmain`: explicit C API with exception containment and minimal entry point.
 
 Core tests cover formatting, large addresses, log escaping, initialization
@@ -173,5 +258,5 @@ Windows smoke tests validate real module bases, Unicode output paths, named
 exports and repeated load/start/snapshot/stop/unload cycles. They do not test
 anti-cheat behavior or Phantom's injection methods.
 
-Later PRs can add PatternScanner,
-StructureInspector, OffsetManager and JSON/C++ ExportManager independently.
+Later PRs can add StructureInspector, OffsetManager and JSON/C++ ExportManager
+independently.
